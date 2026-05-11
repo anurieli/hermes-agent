@@ -512,6 +512,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['later', 'q'],
     help: 'inspect or enqueue a message',
     name: 'queue',
     run: (arg, ctx) => {
@@ -525,6 +526,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
+    aliases: ['also'],
     help: 'inject a message after the next tool call (no interrupt)',
     name: 'steer',
     run: (arg, ctx) => {

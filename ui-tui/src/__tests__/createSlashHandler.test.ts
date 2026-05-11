@@ -705,6 +705,42 @@ describe('createSlashHandler', () => {
       expect(ctx.transcript.sys).toHaveBeenCalledWith('title: demo title')
     })
   })
+
+  it('/later <text> aliases /queue and enqueues the message', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/later finish the report')).toBe(true)
+    expect(ctx.composer.enqueue).toHaveBeenCalledWith('finish the report')
+    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
+  it('/also <text> when idle aliases /steer and falls back to queue', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/also one more thing')).toBe(true)
+    expect(ctx.composer.enqueue).toHaveBeenCalledWith('one more thing')
+    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
+  })
+
+  it('/also <text> when busy aliases /steer and calls session.steer', async () => {
+    patchUiState({ sid: 'sid-abc', busy: true })
+    const rpc = vi.fn(() => Promise.resolve({ status: 'queued' }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/also wait — change the title too')).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('session.steer', {
+      session_id: 'sid-abc',
+      text: 'wait — change the title too'
+    })
+    expect(ctx.composer.enqueue).not.toHaveBeenCalled()
+  })
+
+  it('/q still routes to /queue after the alias addition', () => {
+    const ctx = buildCtx()
+
+    expect(createSlashHandler(ctx)('/q quick note')).toBe(true)
+    expect(ctx.composer.enqueue).toHaveBeenCalledWith('quick note')
+  })
 })
 
 const buildCtx = (overrides: Partial<Ctx> = {}): Ctx => ({
