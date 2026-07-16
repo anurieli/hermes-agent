@@ -81,7 +81,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from toolsets import get_toolset_names
 
@@ -2586,9 +2586,21 @@ def block_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    kind: Optional[str] = None,
+    choices: Optional[Sequence[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running -> blocked``."""
+    normalized_kind = str(kind or "needs_input").strip().lower()
+    if normalized_kind not in {"dependency", "needs_input", "capability", "transient"}:
+        raise ValueError(f"unsupported block kind: {kind}")
+    normalized_choices: list[str] = []
+    if choices:
+        if isinstance(choices, (str, bytes)):
+            raise ValueError("choices must be a list of strings")
+        normalized_choices = [str(choice).strip() for choice in choices if str(choice).strip()]
+        if len(normalized_choices) > 8:
+            raise ValueError("choices supports at most 8 options")
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -2632,8 +2644,82 @@ def block_task(
                 outcome="blocked",
                 summary=reason,
             )
-        _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
+        payload: dict[str, Any] = {"reason": reason, "kind": normalized_kind}
+        if normalized_choices:
+            payload["choices"] = normalized_choices
+        _append_event(conn, task_id, "blocked", payload, run_id=run_id)
         return True
+
+
+def answer_blocked_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    blocked_event_id: int,
+    author: str,
+    answer: str,
+) -> Optional[str]:
+    """Atomically record a human answer and resume the matching blocked task.
+
+    ``blocked_event_id`` binds an answer to one specific decision card. A
+    duplicate tap, an old card from a previous block cycle, or a reply after a
+    manual unblock returns ``None`` without writing a comment.
+    """
+    normalized_author = str(author or "").strip()
+    normalized_answer = str(answer or "").strip()
+    if not normalized_author:
+        raise ValueError("comment author is required")
+    if not normalized_answer:
+        raise ValueError("answer is required")
+
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if task_row is None or task_row["status"] != "blocked":
+            return None
+        latest_block = conn.execute(
+            "SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest_block is None or int(latest_block["id"]) != int(blocked_event_id):
+            return None
+
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, normalized_author, normalized_answer, now),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": normalized_author, "len": len(normalized_answer)},
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'blocked'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        _append_event(
+            conn,
+            task_id,
+            "unblocked",
+            {"status": new_status, "answered_event_id": int(blocked_event_id)},
+        )
+        return new_status
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:

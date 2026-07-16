@@ -4079,6 +4079,79 @@ class GatewayRunner:
         except Exception:
             return "default"
 
+    @staticmethod
+    def _kanban_card_text(value: Any, limit: int) -> str:
+        """Collapse control characters and cap user-authored decision text."""
+        text = " ".join(str(value or "").replace("\x00", "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(1, limit - 1)].rstrip() + "…"
+
+    @classmethod
+    def _kanban_project_label(cls, task: Any) -> str:
+        tenant = cls._kanban_card_text(getattr(task, "tenant", None), 48)
+        if tenant:
+            return tenant
+        workspace = str(getattr(task, "workspace_path", None) or "").strip()
+        if not workspace:
+            return ""
+        path = Path(workspace)
+        if path.parent.name == ".worktrees":
+            return cls._kanban_card_text(path.parent.parent.name, 48)
+        return cls._kanban_card_text(path.name, 48)
+
+    @classmethod
+    def _kanban_decision_card(cls, task: Any, event: Any) -> tuple[str, dict[str, Any]]:
+        """Render a concise blocked-task card plus Telegram-native controls."""
+        payload = event.payload or {}
+        task_id = str(task.id)
+        event_id = int(event.id)
+        assignee = cls._kanban_card_text(getattr(task, "assignee", None), 40)
+        project = cls._kanban_project_label(task)
+        identity = " · ".join(
+            part for part in (f"@{assignee}" if assignee else "", project) if part
+        )
+        title = cls._kanban_card_text(getattr(task, "title", None), 120) or "Blocked work"
+        reason = cls._kanban_card_text(payload.get("reason"), 320) or "A decision is required to continue."
+        lines = ["🟡 Waiting for you"]
+        if identity:
+            lines.append(identity)
+        lines.extend(
+            [
+                "",
+                f"Working on: {title}",
+                f"Needs your decision: {reason}",
+                "After you answer: the task resumes automatically.",
+            ]
+        )
+
+        rows: list[list[dict[str, str]]] = []
+        raw_choices = payload.get("choices") or []
+        if isinstance(raw_choices, list):
+            for index, raw_choice in enumerate(raw_choices[:8]):
+                label = cls._kanban_card_text(raw_choice, 80)
+                if label:
+                    rows.append(
+                        [{
+                            "text": label,
+                            "callback_data": f"kd:c:{task_id}:{event_id}:{index}",
+                        }]
+                    )
+        rows.append(
+            [
+                {"text": "Respond", "callback_data": f"kd:r:{task_id}:{event_id}"},
+                {"text": "Later", "callback_data": f"kd:l:{task_id}:{event_id}"},
+            ]
+        )
+        return "\n".join(lines), {
+            "telegram_inline_keyboard": rows,
+            "telegram_kanban_decision": {
+                "task_id": task_id,
+                "blocked_event_id": event_id,
+            },
+            "notify": True,
+        }
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -4266,6 +4339,7 @@ class GatewayRunner:
                     title = (task.title if task else sub["task_id"])[:120]
                     for ev in d["events"]:
                         kind = ev.kind
+                        decision_metadata: dict[str, Any] = {}
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -4292,10 +4366,14 @@ class GatewayRunner:
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            block_kind = str((ev.payload or {}).get("kind") or "needs_input")
+                            if platform_str == "telegram" and block_kind == "needs_input" and task:
+                                msg, decision_metadata = self._kanban_decision_card(task, ev)
+                            else:
+                                reason = ""
+                                if ev.payload and ev.payload.get("reason"):
+                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -4322,14 +4400,20 @@ class GatewayRunner:
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        metadata.update(decision_metadata)
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
+                            send_result = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
+                            if getattr(send_result, "success", True) is False:
+                                raise RuntimeError(
+                                    getattr(send_result, "error", None)
+                                    or "adapter reported an unsuccessful send"
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -8454,6 +8538,57 @@ class GatewayRunner:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _kanban_waiting_for_source(source: Any) -> list[tuple[Any, Any]]:
+        """Return current human decisions subscribed to this exact route."""
+        from hermes_cli import kanban_db as kb
+
+        try:
+            boards = kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+        seen_paths: set[str] = set()
+        waiting: list[tuple[Any, Any]] = []
+        platform = getattr(source.platform, "value", str(source.platform)).lower()
+        chat_id = str(source.chat_id)
+        thread_id = str(source.thread_id or "")
+        for board_meta in boards:
+            board = board_meta.get("slug") or kb.DEFAULT_BOARD
+            db_path = board_meta.get("db_path")
+            try:
+                resolved = str(
+                    Path(db_path).expanduser().resolve()
+                    if db_path else kb.kanban_db_path(board).resolve()
+                )
+            except Exception:
+                resolved = f"slug:{board}"
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            conn = kb.connect(board=board)
+            try:
+                for task in kb.list_tasks(conn, status="blocked", limit=250):
+                    subscribed = any(
+                        str(sub.get("platform") or "").lower() == platform
+                        and str(sub.get("chat_id") or "") == chat_id
+                        and str(sub.get("thread_id") or "") == thread_id
+                        for sub in kb.list_notify_subs(conn, task.id)
+                    )
+                    if not subscribed:
+                        continue
+                    blocked_events = [
+                        item for item in kb.list_events(conn, task.id)
+                        if item.kind == "blocked"
+                    ]
+                    if not blocked_events:
+                        continue
+                    blocked_event = blocked_events[-1]
+                    if str((blocked_event.payload or {}).get("kind") or "needs_input") == "needs_input":
+                        waiting.append((task, blocked_event))
+            finally:
+                conn.close()
+        return waiting
+
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
         from tools.process_registry import format_uptime_short, process_registry
@@ -8501,6 +8636,25 @@ class GatewayRunner:
             t("gateway.agents.active_agents", count=len(agent_rows)),
         ]
 
+        waiting = await asyncio.to_thread(self._kanban_waiting_for_source, event.source)
+        if waiting:
+            lines.extend(["", f"**Waiting for you:** {len(waiting)}"])
+            for task, blocked_event in waiting:
+                title = self._kanban_card_text(task.title, 96)
+                reason = self._kanban_card_text((blocked_event.payload or {}).get("reason"), 120)
+                project = self._kanban_project_label(task)
+                label = f"{project}: {title}" if project else title
+                lines.append(f"• {label}" + (f" — {reason}" if reason else ""))
+
+            if event.source.platform == Platform.TELEGRAM:
+                adapter = self.adapters.get(Platform.TELEGRAM)
+                if adapter:
+                    for task, blocked_event in waiting[:8]:
+                        card, metadata = self._kanban_decision_card(task, blocked_event)
+                        if event.source.thread_id:
+                            metadata["thread_id"] = event.source.thread_id
+                        await adapter.send(event.source.chat_id, card, metadata=metadata)
+
         if agent_rows:
             for idx, row in enumerate(agent_rows[:12], 1):
                 current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
@@ -8538,7 +8692,7 @@ class GatewayRunner:
             ]
         )
 
-        if not agent_rows and not running_processes and not background_tasks:
+        if not agent_rows and not running_processes and not background_tasks and not waiting:
             lines.append("")
             lines.append(t("gateway.agents.none"))
 

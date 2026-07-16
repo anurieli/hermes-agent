@@ -448,12 +448,18 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
+    kind = args.get("kind") or "needs_input"
+    choices = args.get("choices")
+    if choices is not None and not isinstance(choices, list):
+        return tool_error("choices must be a list of strings")
     try:
         kb, conn = _connect()
         try:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
+                kind=kind,
+                choices=choices,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -838,6 +844,25 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered, in one or two sentences. "
                     "Don't paste the whole conversation; the human has "
                     "the board and can ask follow-ups via comments."
+                ),
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "description": (
+                    "Why the task is blocked. Use needs_input for a human "
+                    "decision, dependency when another task must finish, "
+                    "capability for a hard access wall, or transient for a "
+                    "failure that may clear. Defaults to needs_input."
+                ),
+            },
+            "choices": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1, "maxLength": 120},
+                "maxItems": 8,
+                "description": (
+                    "Optional concise answers for a human decision. Telegram "
+                    "renders one button per choice; free-text Respond remains available."
                 ),
             },
         },

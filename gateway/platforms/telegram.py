@@ -19,7 +19,14 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update,
+        Bot,
+        Message,
+        ForceReply,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -42,6 +49,7 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    ForceReply = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -110,6 +118,7 @@ def check_telegram_requirements() -> bool:
 # Matches every character that MarkdownV2 requires to be backslash-escaped
 # when it appears outside a code span or fenced code block.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
+_KANBAN_DECISION_REPLY_RE = re.compile(r"\[kanban:(t_[0-9a-f]+):(\d+)\]")
 
 
 def _escape_mdv2(text: str) -> str:
@@ -377,6 +386,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Decision-card copies and ForceReply prompts are bound to concrete
+        # Telegram messages so duplicate cards can be disabled together and a
+        # user-authored marker cannot impersonate a pending prompt.
+        self._kanban_decision_messages: Dict[
+            tuple[str, int], set[tuple[str, int]]
+        ] = {}
+        self._kanban_reply_prompts: Dict[
+            tuple[str, int], tuple[str, int, str]
+        ] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -401,6 +419,92 @@ class TelegramAdapter(BasePlatformAdapter):
         if (metadata or {}).get("notify"):
             return {}
         return {"disable_notification": True}
+
+    @staticmethod
+    def _inline_keyboard_from_metadata(
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Build a validated Telegram inline keyboard from adapter metadata."""
+        raw_rows = (metadata or {}).get("telegram_inline_keyboard")
+        if not isinstance(raw_rows, list) or not raw_rows:
+            return None
+        rows = []
+        # Kanban cards support eight structured choices plus the mandatory
+        # Respond/Later row. Telegram permits more than eight keyboard rows.
+        for raw_row in raw_rows[:9]:
+            if not isinstance(raw_row, list):
+                continue
+            row = []
+            for raw_button in raw_row[:8]:
+                if not isinstance(raw_button, dict):
+                    continue
+                text = str(raw_button.get("text") or "").strip()[:80]
+                callback_data = str(raw_button.get("callback_data") or "").strip()
+                if not text or not callback_data or len(callback_data.encode("utf-8")) > 64:
+                    continue
+                row.append(InlineKeyboardButton(text, callback_data=callback_data))
+            if row:
+                rows.append(row)
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    def _remember_kanban_decision_message(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        chat_id: str,
+        message_id: Any,
+    ) -> None:
+        decision = (metadata or {}).get("telegram_kanban_decision")
+        if not isinstance(decision, dict) or message_id is None:
+            return
+        try:
+            key = (
+                str(decision["task_id"]),
+                int(decision["blocked_event_id"]),
+            )
+            location = (str(chat_id), int(message_id))
+        except (KeyError, TypeError, ValueError):
+            return
+        self._kanban_decision_messages.setdefault(key, set()).add(location)
+
+    async def _disable_kanban_decision_messages(
+        self,
+        task_id: str,
+        blocked_event_id: int,
+        *,
+        query: Any = None,
+    ) -> None:
+        """Remove controls from every in-process copy of a decision card."""
+        key = (str(task_id), int(blocked_event_id))
+        locations = self._kanban_decision_messages.pop(key, set())
+        query_message = getattr(query, "message", None)
+        query_location = None
+        if query_message is not None:
+            query_chat_id = getattr(query_message, "chat_id", None)
+            query_message_id = getattr(query_message, "message_id", None)
+            if query_chat_id is not None and query_message_id is not None:
+                query_location = (str(query_chat_id), int(query_message_id))
+                locations.discard(query_location)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        if not self._bot:
+            return
+        for chat_id, message_id in locations:
+            try:
+                await self._bot.edit_message_reply_markup(
+                    chat_id=int(chat_id),
+                    message_id=message_id,
+                    reply_markup=None,
+                )
+            except Exception:
+                logger.debug(
+                    "[Telegram] Could not disable stale Kanban card %s/%s",
+                    chat_id,
+                    message_id,
+                    exc_info=True,
+                )
 
     def _is_callback_user_authorized(
         self,
@@ -438,11 +542,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return bool(auth_fn(source))
             except Exception:
-                logger.debug(
-                    "[Telegram] Falling back to env-only callback auth for user %s",
+                logger.warning(
+                    "[Telegram] Callback auth hook failed closed for user %s",
                     normalized_user_id,
                     exc_info=True,
                 )
+                return False
 
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
@@ -1467,6 +1572,7 @@ class TelegramAdapter(BasePlatformAdapter):
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
+            inline_keyboard = self._inline_keyboard_from_metadata(metadata)
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -1484,6 +1590,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
+                keyboard_kwargs = (
+                    {"reply_markup": inline_keyboard}
+                    if i == 0 and inline_keyboard is not None
+                    else {}
+                )
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
                 reply_to_source = reply_to or (
                     str(metadata_reply_to)
@@ -1515,6 +1626,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **keyboard_kwargs,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -1529,6 +1641,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **keyboard_kwargs,
                                 )
                             else:
                                 raise
@@ -1604,11 +1717,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_ids.append(str(msg.message_id))
             
-            return SendResult(
+            result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
+            self._remember_kanban_decision_message(
+                metadata,
+                chat_id=chat_id,
+                message_id=result.message_id,
+            )
+            return result
             
         except Exception as e:
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
@@ -2468,6 +2587,298 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    def _lookup_kanban_decision(
+        self,
+        task_id: str,
+        blocked_event_id: int,
+        *,
+        chat_id: str,
+        thread_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolve a decision card to its subscribed board and current event."""
+        from hermes_cli import kanban_db as kb
+
+        try:
+            boards = kb.list_boards(include_archived=False)
+        except Exception:
+            boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
+        seen_paths: set[str] = set()
+        found_task = False
+        normalized_thread = str(thread_id or "")
+        for board_meta in boards:
+            board = board_meta.get("slug") or kb.DEFAULT_BOARD
+            db_path = board_meta.get("db_path")
+            try:
+                resolved = str(
+                    _Path(db_path).expanduser().resolve()
+                    if db_path else kb.kanban_db_path(board).resolve()
+                )
+            except Exception:
+                resolved = f"slug:{board}"
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            conn = kb.connect(board=board)
+            try:
+                task = kb.get_task(conn, task_id)
+                if task is None:
+                    continue
+                found_task = True
+                subscribed = any(
+                    str(sub.get("platform") or "").lower() == "telegram"
+                    and str(sub.get("chat_id") or "") == str(chat_id)
+                    and str(sub.get("thread_id") or "") == normalized_thread
+                    for sub in kb.list_notify_subs(conn, task_id)
+                )
+                if not subscribed:
+                    continue
+                blocked_events = [
+                    event for event in kb.list_events(conn, task_id)
+                    if event.kind == "blocked"
+                ]
+                if task.status != "blocked":
+                    return {"state": "resolved", "board": board, "task": task}
+                if not blocked_events or int(blocked_events[-1].id) != int(blocked_event_id):
+                    return {"state": "stale", "board": board, "task": task}
+                return {
+                    "state": "current",
+                    "board": board,
+                    "task": task,
+                    "event": blocked_events[-1],
+                }
+            finally:
+                conn.close()
+        return {"state": "unavailable" if found_task else "missing"}
+
+    @staticmethod
+    def _answer_kanban_decision(
+        decision: Dict[str, Any],
+        *,
+        blocked_event_id: int,
+        author: str,
+        answer: str,
+    ) -> Optional[str]:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect(board=decision["board"])
+        try:
+            return kb.answer_blocked_task(
+                conn,
+                decision["task"].id,
+                blocked_event_id=blocked_event_id,
+                author=author,
+                answer=answer,
+            )
+        finally:
+            conn.close()
+
+    async def _handle_kanban_decision_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        chat_id: Any,
+        chat_type: Any,
+        thread_id: Any,
+        user_name: Any,
+    ) -> None:
+        parts = data.split(":")
+        if len(parts) not in {4, 5}:
+            await query.answer(text="Invalid decision card.")
+            return
+        action, task_id = parts[1], parts[2]
+        try:
+            blocked_event_id = int(parts[3])
+        except (TypeError, ValueError):
+            await query.answer(text="Invalid decision card.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=str(chat_id) if chat_id is not None else None,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to answer this prompt.")
+            return
+
+        decision = await asyncio.to_thread(
+            self._lookup_kanban_decision,
+            task_id,
+            blocked_event_id,
+            chat_id=str(chat_id),
+            thread_id=str(thread_id) if thread_id is not None else None,
+        )
+        state = decision.get("state")
+        if state == "resolved":
+            await self._disable_kanban_decision_messages(
+                task_id, blocked_event_id, query=query,
+            )
+            await query.answer(text="This decision has already been resolved.")
+            return
+        if state == "stale":
+            await self._disable_kanban_decision_messages(
+                task_id, blocked_event_id, query=query,
+            )
+            await query.answer(text="This decision card is no longer current.")
+            return
+        if state != "current":
+            await query.answer(text="This decision card is unavailable.")
+            return
+
+        if action == "l":
+            await query.answer(text="Left waiting.")
+            try:
+                await query.edit_message_text(
+                    text="🟡 Left waiting — open /tasks when you're ready to answer.",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "r":
+            task_title = " ".join(str(decision["task"].title or "blocked task").split())[:120]
+            prompt = (
+                f"Reply with your answer for “{task_title}”.\n\n"
+                f"[kanban:{task_id}:{blocked_event_id}]"
+            )
+            send_kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": prompt,
+                "reply_markup": ForceReply(selective=True),
+                "reply_to_message_id": getattr(query.message, "message_id", None),
+            }
+            send_kwargs.update(
+                self._thread_kwargs_for_send(
+                    str(chat_id),
+                    str(thread_id) if thread_id is not None else None,
+                    {"thread_id": str(thread_id)} if thread_id is not None else None,
+                    reply_to_message_id=getattr(query.message, "message_id", None),
+                )
+            )
+            prompt_message = await self._bot.send_message(**send_kwargs)
+            prompt_message_id = getattr(prompt_message, "message_id", None)
+            if prompt_message_id is None:
+                await query.answer(text="Could not open a reply prompt. Try again.")
+                return
+            self._kanban_reply_prompts[(str(chat_id), int(prompt_message_id))] = (
+                task_id,
+                blocked_event_id,
+                str(thread_id or ""),
+            )
+            try:
+                await query.edit_message_text(
+                    text=(
+                        f"🟡 Waiting for your reply: {task_title}\n"
+                        "Reply to the prompt below to resume the task."
+                    ),
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            await query.answer(text="Reply below with your answer.")
+            return
+
+        if action != "c" or len(parts) != 5:
+            await query.answer(text="Invalid decision card action.")
+            return
+        try:
+            choice_index = int(parts[4])
+            choices = (decision["event"].payload or {}).get("choices") or []
+            answer = str(choices[choice_index]).strip()
+        except (IndexError, TypeError, ValueError):
+            await query.answer(text="That choice is no longer available.")
+            return
+        new_status = await asyncio.to_thread(
+            self._answer_kanban_decision,
+            decision,
+            blocked_event_id=blocked_event_id,
+            author=f"telegram:{caller_id}",
+            answer=answer,
+        )
+        if not new_status:
+            await self._disable_kanban_decision_messages(
+                task_id, blocked_event_id, query=query,
+            )
+            await query.answer(text="This decision has already been resolved.")
+            return
+        await self._disable_kanban_decision_messages(
+            task_id, blocked_event_id, query=query,
+        )
+        await query.answer(text="Answer recorded. Work resumed.")
+        try:
+            await query.edit_message_text(
+                text=f"🟢 Answer recorded: {answer}\nWork resumed.",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    async def _try_handle_kanban_decision_reply(self, message: Any) -> bool:
+        """Consume a ForceReply answer without sending it through the agent."""
+        reply = getattr(message, "reply_to_message", None)
+        if not getattr(getattr(reply, "from_user", None), "is_bot", False):
+            return False
+        prompt = (getattr(reply, "text", None) or getattr(reply, "caption", None) or "")
+        match = _KANBAN_DECISION_REPLY_RE.search(prompt)
+        if not match:
+            return False
+        task_id, raw_event_id = match.groups()
+        chat = getattr(message, "chat", None)
+        user = getattr(message, "from_user", None)
+        chat_id = str(getattr(chat, "id", ""))
+        thread_id = getattr(message, "message_thread_id", None)
+        prompt_message_id = getattr(reply, "message_id", None)
+        try:
+            prompt_key = (chat_id, int(prompt_message_id))
+        except (TypeError, ValueError):
+            return False
+        blocked_event_id = int(raw_event_id)
+        expected = self._kanban_reply_prompts.get(prompt_key)
+        if expected != (task_id, blocked_event_id, str(thread_id or "")):
+            return False
+        caller_id = str(getattr(user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(getattr(chat, "type", "private")),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=getattr(user, "first_name", None),
+        ):
+            await self._bot.send_message(chat_id=int(chat_id), text="⛔ You are not authorized to answer this prompt.")
+            return True
+        answer = str(getattr(message, "text", "") or "").strip()
+        if not answer:
+            await self._bot.send_message(chat_id=int(chat_id), text="Please reply with a non-empty answer.")
+            return True
+        decision = await asyncio.to_thread(
+            self._lookup_kanban_decision,
+            task_id,
+            blocked_event_id,
+            chat_id=chat_id,
+            thread_id=str(thread_id) if thread_id is not None else None,
+        )
+        if decision.get("state") != "current":
+            self._kanban_reply_prompts.pop(prompt_key, None)
+            await self._disable_kanban_decision_messages(task_id, blocked_event_id)
+            await self._bot.send_message(chat_id=int(chat_id), text="That decision is no longer current.")
+            return True
+        new_status = await asyncio.to_thread(
+            self._answer_kanban_decision,
+            decision,
+            blocked_event_id=blocked_event_id,
+            author=f"telegram:{caller_id}",
+            answer=answer[:4000],
+        )
+        self._kanban_reply_prompts.pop(prompt_key, None)
+        await self._disable_kanban_decision_messages(task_id, blocked_event_id)
+        ack = "Answer recorded. Work resumed." if new_status else "That decision was already resolved."
+        await self._bot.send_message(chat_id=int(chat_id), text=ack)
+        return True
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -2488,6 +2899,18 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
+            return
+
+        # --- Kanban decision cards (kd:action:task:event[:choice]) ---
+        if data.startswith("kd:"):
+            await self._handle_kanban_decision_callback(
+                query,
+                data,
+                chat_id=query_chat_id,
+                chat_type=query_chat_type,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            )
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

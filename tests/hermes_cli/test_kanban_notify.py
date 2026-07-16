@@ -209,11 +209,12 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
-    assert "second block" not in blocked_deliveries[0]
-    assert "second block" in blocked_deliveries[1]
-    assert len(blocked_deliveries) == 2, (
-        f"Should receive 2 blocked notification, but only get {len(blocked_deliveries)} count\n"
+    decision_cards = [m for m in delivered_msgs if m.startswith("🟡 Waiting for you")]
+    assert "first block" in decision_cards[0]
+    assert "second block" not in decision_cards[0]
+    assert "second block" in decision_cards[1]
+    assert len(decision_cards) == 2, (
+        f"Should receive 2 blocked decision cards, but only got {len(decision_cards)}\n"
         f"Message {delivered_msgs}"
     )
 
