@@ -16,10 +16,13 @@ import logging
 import os
 import html as _html
 import re
+import secrets
+import shlex
 import threading
+from collections import OrderedDict
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +209,15 @@ async def _shutdown_abandoned_app(app) -> None:
             logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update,
+        Bot,
+        Message,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        CopyTextButton,
+        ForceReply,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -229,6 +240,8 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+    CopyTextButton = Any
+    ForceReply = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -372,7 +385,7 @@ def check_telegram_requirements() -> bool:
     so the adapter's class-level type aliases get rebound.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
-    global InlineKeyboardMarkup, LinkPreviewOptions, Application
+    global InlineKeyboardMarkup, CopyTextButton, ForceReply, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
@@ -384,7 +397,12 @@ def check_telegram_requirements() -> bool:
         return False
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
-        from telegram import InlineKeyboardButton as _IKB, InlineKeyboardMarkup as _IKM
+        from telegram import (
+            InlineKeyboardButton as _IKB,
+            InlineKeyboardMarkup as _IKM,
+            CopyTextButton as _CTB,
+            ForceReply as _FR,
+        )
         try:
             from telegram import LinkPreviewOptions as _LPO
         except ImportError:
@@ -404,6 +422,8 @@ def check_telegram_requirements() -> bool:
     Message = _Message
     InlineKeyboardButton = _IKB
     InlineKeyboardMarkup = _IKM
+    CopyTextButton = _CTB
+    ForceReply = _FR
     LinkPreviewOptions = _LPO
     Application = _App
     CommandHandler = _CH
@@ -581,6 +601,33 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
+
+    # Agent-authored inline buttons (":::buttons" blocks in outgoing agent
+    # messages). See _extract_agent_buttons() / _handle_agent_button().
+    _AGENT_BUTTONS_RE = re.compile(
+        r"^[ \t]*:::[ \t]*buttons([ \t]+multi)?[ \t]*\n(.*?)^[ \t]*:::[ \t]*$\n?",
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    )
+    _AGENT_BUTTONS_MAX_STATES = 100
+    _AGENT_BUTTONS_MAX_OPTIONS = 12
+    _TRANSCRIPT_ACTIONS_MAX_STATES = 100
+    _KANBAN_DECISION_MAX_STATES = 200
+    _COPY_TEXT_MAX_CHARS = 256
+
+    # AAS-88 Part 1b: a single-select option payload prefixed with this marker
+    # resolves as a BACKEND COMMAND instead of an injected chat message — see
+    # _run_backend_command() and the safety boundary documented there.
+    _BACKEND_COMMAND_PREFIX = "cmd:"
+    _BACKEND_COMMAND_TIMEOUT_SECONDS = 60
+    # AAS-88 Part 1: known (helper, subcommand) -> (verb, singular noun) used
+    # to phrase the one-line summary for a multi-select backend-command batch
+    # when every selected command shares the same helper+subcommand. Anything
+    # not listed here (or a mixed batch) falls back to a generic count line
+    # in _summarize_backend_batch() -- this stays a cosmetic lookup, never a
+    # requirement for new backend-command buttons to work.
+    _BACKEND_COMMAND_SUMMARY_VERBS = {
+        ("reminders.py", "cross-off"): ("Crossed off", "reminder"),
+    }
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -787,6 +834,25 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Agent-authored inline buttons (":::buttons" blocks in outgoing
+        # messages): state_id → spec dict. FIFO-capped at
+        # _AGENT_BUTTONS_MAX_STATES via _register_agent_buttons() (mirrors
+        # WhatsApp Cloud's _bounded_put pattern). See _extract_agent_buttons().
+        self._agent_buttons: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Actionable STT echoes. Native copy buttons do not generate callbacks,
+        # so copy and dismissal intentionally remain separate actions.
+        self._transcript_action_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # Human-in-the-loop Kanban decision cards. The card state binds a
+        # compact callback token to board/task/chat/message identity; free-text
+        # prompts add a second index by ForceReply message id so multiple
+        # simultaneous blocked tasks cannot capture the wrong response.
+        self._kanban_decision_state: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._kanban_decision_prompts: "OrderedDict[tuple[str, int], str]" = OrderedDict()
+        # AAS-88 Part 1b: serializes backend-command button taps (see
+        # _run_backend_command) so two rapid approve/deny taps run their
+        # committer subprocesses one at a time instead of racing the same
+        # on-disk store (pending_filing.py, Todoist ledger, reminders.md).
+        self._backend_command_lock = asyncio.Lock()
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -3932,6 +3998,281 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    def _register_transcript_actions(
+        self,
+        *,
+        chat_id: str,
+        transcript: str,
+        original_message_id: Optional[str],
+    ) -> str:
+        """Register exact message scope for a transcript Done callback."""
+        while True:
+            state_id = secrets.token_hex(4)
+            if state_id not in self._transcript_action_state:
+                break
+        self._transcript_action_state[state_id] = {
+            "chat_id": str(chat_id),
+            "transcript": transcript,
+            "original_message_id": (
+                str(original_message_id) if original_message_id is not None else None
+            ),
+            "message_ids": [],
+        }
+        while len(self._transcript_action_state) > self._TRANSCRIPT_ACTIONS_MAX_STATES:
+            self._transcript_action_state.popitem(last=False)
+        return state_id
+
+    def _transcript_actions_keyboard(
+        self,
+        transcript: str,
+        state_id: str,
+    ) -> "InlineKeyboardMarkup":
+        """Build native copy button(s) plus a callback-backed Done button.
+
+        Bot API copy_text is capped at 256 characters and cannot share
+        callback_data. Longer transcripts use truthfully labelled copy-part
+        buttons; Done is necessarily a separate tap.
+        """
+        chunks = [
+            transcript[index:index + self._COPY_TEXT_MAX_CHARS]
+            for index in range(0, len(transcript), self._COPY_TEXT_MAX_CHARS)
+        ]
+        copy_buttons = [
+            InlineKeyboardButton(
+                "📋 Copy" if len(chunks) == 1 else f"📋 Copy {index + 1}/{len(chunks)}",
+                copy_text=CopyTextButton(chunk),
+            )
+            for index, chunk in enumerate(chunks)
+        ]
+        rows = [
+            copy_buttons[index:index + 2]
+            for index in range(0, len(copy_buttons), 2)
+        ]
+        rows.append(
+            [InlineKeyboardButton("✅ Done", callback_data=f"tx:{state_id}:done")]
+        )
+        return InlineKeyboardMarkup(rows)
+
+    def _kanban_decision_states(self) -> "OrderedDict[str, Dict[str, Any]]":
+        states = getattr(self, "_kanban_decision_state", None)
+        if states is None:
+            states = OrderedDict()
+            self._kanban_decision_state = states
+        return states
+
+    def _kanban_decision_prompt_states(self) -> "OrderedDict[tuple[str, int], str]":
+        prompts = getattr(self, "_kanban_decision_prompts", None)
+        if prompts is None:
+            prompts = OrderedDict()
+            self._kanban_decision_prompts = prompts
+        return prompts
+
+    def _drop_kanban_decision_state(self, state_id: str) -> Optional[Dict[str, Any]]:
+        state = self._kanban_decision_states().pop(state_id, None)
+        prompts = self._kanban_decision_prompt_states()
+        for key, prompt_state_id in list(prompts.items()):
+            if prompt_state_id == state_id:
+                prompts.pop(key, None)
+        return state
+
+    @staticmethod
+    def _kanban_decision_text(
+        *,
+        assignee: str,
+        title: str,
+        reason: str,
+        project_label: Optional[str] = None,
+        block_kind: Optional[str] = None,
+    ) -> str:
+        agent = " ".join(
+            str(assignee or "Agent").replace("-", " ").replace("_", " ").split()
+        ).title()
+        doing = " ".join(str(title or "Blocked work").split())[:180]
+        question = " ".join(str(reason or "What should I do next?").split())[:700]
+        scope = (
+            f" · {_html.escape(' '.join(project_label.split())[:160])}"
+            if project_label
+            else ""
+        )
+        stopped = (
+            "Human action is required"
+            if block_kind == "capability"
+            else "Your decision is required"
+        )
+        return (
+            "<b>Decision needed</b>\n"
+            f"{_html.escape(agent)}{scope}\n\n"
+            f"<b>Doing:</b> {_html.escape(doing)}\n"
+            f"<b>Stopped:</b> {stopped}\n"
+            f"<b>Question:</b> {_html.escape(question)}\n\n"
+            f"After you answer, {_html.escape(agent)} resumes automatically."
+        )
+
+    async def send_kanban_decision_card(
+        self,
+        *,
+        chat_id: str,
+        task_id: str,
+        board: Optional[str],
+        blocked_event_id: Optional[int] = None,
+        assignee: str,
+        title: str,
+        reason: str,
+        choices: Optional[List[str]] = None,
+        project_label: Optional[str] = None,
+        block_kind: Optional[str] = None,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Telegram-native, task-bound human decision card."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        clean_choices: List[str] = []
+        for raw_choice in choices or []:
+            choice = " ".join(str(raw_choice).split())[:64]
+            if choice and choice not in clean_choices:
+                clean_choices.append(choice)
+            if len(clean_choices) >= 8:
+                break
+
+        states = self._kanban_decision_states()
+        while True:
+            state_id = secrets.token_hex(4)
+            if state_id not in states:
+                break
+        state: Dict[str, Any] = {
+            "task_id": str(task_id),
+            "board": board,
+            "blocked_event_id": blocked_event_id,
+            "chat_id": str(chat_id),
+            "thread_id": str((metadata or {}).get("thread_id") or ""),
+            "user_id": str(user_id or ""),
+            "choices": clean_choices,
+            "card_message_id": None,
+            "text": self._kanban_decision_text(
+                assignee=assignee,
+                title=title,
+                reason=reason,
+                project_label=project_label,
+                block_kind=block_kind,
+            ),
+        }
+        states[state_id] = state
+        while len(states) > self._KANBAN_DECISION_MAX_STATES:
+            expired_id, _ = states.popitem(last=False)
+            self._drop_kanban_decision_state(expired_id)
+
+        rows = [
+            [InlineKeyboardButton(choice, callback_data=f"kb:{state_id}:c{index}")]
+            for index, choice in enumerate(clean_choices)
+        ]
+        rows.append([
+            InlineKeyboardButton("Respond", callback_data=f"kb:{state_id}:r"),
+            InlineKeyboardButton("Later", callback_data=f"kb:{state_id}:l"),
+        ])
+        keyboard = InlineKeyboardMarkup(rows)
+        thread_id = self._metadata_thread_id(metadata)
+        try:
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=state["text"],
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._notification_kwargs({**(metadata or {}), "notify": True}),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            self._drop_kanban_decision_state(state_id)
+            return SendResult(success=False, error=str(exc), retryable=True)
+        state["card_message_id"] = int(msg.message_id)
+        return SendResult(success=True, message_id=str(msg.message_id))
+
+    @staticmethod
+    def _answer_kanban_decision_sync(
+        state: Dict[str, Any], *, author: str, answer: str
+    ) -> Optional[str]:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=state.get("board"))
+        try:
+            return _kb.answer_blocked_task(
+                conn,
+                state["task_id"],
+                author=author,
+                answer=answer,
+                blocked_event_id=state.get("blocked_event_id"),
+            )
+        finally:
+            conn.close()
+
+    async def _consume_kanban_decision_reply(self, message: Message) -> bool:
+        """Resolve a ForceReply answer without sending it through the agent."""
+        reply = getattr(message, "reply_to_message", None)
+        prompt_id = getattr(reply, "message_id", None)
+        chat_id = str(
+            getattr(message, "chat_id", None)
+            or getattr(getattr(message, "chat", None), "id", "")
+        )
+        if prompt_id is None or not chat_id:
+            return False
+        key = (chat_id, int(prompt_id))
+        state_id = self._kanban_decision_prompt_states().get(key)
+        if not state_id:
+            return False
+        state = self._kanban_decision_states().get(state_id)
+        if not state:
+            self._kanban_decision_prompt_states().pop(key, None)
+            return False
+        caller_id = str(getattr(getattr(message, "from_user", None), "id", ""))
+        if state.get("user_id") and caller_id != state["user_id"]:
+            return False
+        answer = str(getattr(message, "text", "") or "").strip()
+        if not answer:
+            return False
+
+        new_status = await asyncio.to_thread(
+            self._answer_kanban_decision_sync,
+            state,
+            author=f"telegram:{caller_id or 'authorized-user'}",
+            answer=answer,
+        )
+        self._drop_kanban_decision_state(state_id)
+        card_message_id = state.get("card_message_id")
+        if card_message_id:
+            try:
+                suffix = (
+                    f"<b>Answered:</b> {_html.escape(answer[:500])}\nResuming now."
+                    if new_status
+                    else "<i>This decision was already resolved.</i>"
+                )
+                await self._bot.edit_message_text(
+                    chat_id=normalize_telegram_chat_id(chat_id),
+                    message_id=int(card_message_id),
+                    text=f"{state['text']}\n\n{suffix}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+        if new_status:
+            try:
+                await self._bot.send_message(
+                    chat_id=normalize_telegram_chat_id(chat_id),
+                    text="Got it — answer recorded and work resumed.",
+                    reply_to_message_id=getattr(message, "message_id", None),
+                    **self._notification_kwargs(None),
+                )
+            except Exception:
+                pass
+        return True
+
     async def send(
         self,
         chat_id: str,
@@ -3950,14 +4291,63 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        # Multiple ":::buttons" blocks in one outgoing message (e.g. several
+        # approval pieces batched together) cannot share one Telegram message:
+        # Telegram allows a single inline keyboard per message. Split on block
+        # boundaries and send each segment as its own message so every block
+        # renders as real buttons instead of leaking as literal text.
+        _btn_segments = self._split_agent_buttons_segments(content)
+        if len(_btn_segments) > 1:
+            _last: Optional[SendResult] = None
+            for _i, _seg in enumerate(_btn_segments):
+                if not _seg or not _seg.strip():
+                    continue
+                _last = await self.send(
+                    chat_id,
+                    _seg,
+                    reply_to=reply_to if _i == 0 else None,
+                    metadata=metadata,
+                )
+            return _last or SendResult(success=True, message_id=None)
+
+        # Agent-authored inline buttons: strip the ":::buttons" block and
+        # build the keyboard to attach to the final chunk. Buttons force the
+        # legacy MarkdownV2 send path below — sendRichMessage's raw payload
+        # (_try_send_rich) has no reply_markup support.
+        content, buttons_spec = self._extract_agent_buttons(content)
+        buttons_keyboard = None
+        buttons_state_id = None
+        transcript_state_id = None
+        if buttons_spec:
+            if not content.strip():
+                content = "Choose:"
+            buttons_state_id = self._register_agent_buttons(buttons_spec)
+            buttons_keyboard = self._agent_buttons_keyboard(buttons_state_id)
+        elif not content.strip():
+            return SendResult(success=True, message_id=None)
+
+        transcript_text = (metadata or {}).get("telegram_transcript_text")
+        if isinstance(transcript_text, str) and transcript_text and buttons_keyboard is None:
+            transcript_state_id = self._register_transcript_actions(
+                chat_id=str(chat_id),
+                transcript=transcript_text,
+                original_message_id=(metadata or {}).get(
+                    "telegram_transcript_original_message_id"
+                ),
+            )
+            buttons_keyboard = self._transcript_actions_keyboard(
+                transcript_text,
+                transcript_state_id,
+            )
+
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if buttons_keyboard is None and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -4053,6 +4443,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
+                # Attach the agent-buttons keyboard to the final chunk only.
+                chunk_reply_markup = (
+                    buttons_keyboard if i == len(chunks) - 1 else None
+                )
+
                 msg = None
                 for _send_attempt in range(3):
                     try:
@@ -4063,6 +4458,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=chunk_reply_markup,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -4077,6 +4473,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=chunk_reply_markup,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -4203,6 +4600,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
+                if chunk_reply_markup is not None and buttons_state_id and msg is not None:
+                    state = self._agent_buttons.get(buttons_state_id)
+                    if state is not None:
+                        state["chat_id"] = str(chat_id)
+                        state["message_id"] = msg.message_id
+                if chunk_reply_markup is not None and transcript_state_id and msg is not None:
+                    state = self._transcript_action_state.get(transcript_state_id)
+                    if state is not None:
+                        state["message_ids"] = list(message_ids)
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -4231,6 +4637,15 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             
         except Exception as e:
+            # Drop orphaned button state if the message never went out.
+            if buttons_state_id:
+                state = self._agent_buttons.get(buttons_state_id)
+                if state is not None and "message_id" not in state:
+                    self._agent_buttons.pop(buttons_state_id, None)
+            if transcript_state_id:
+                state = self._transcript_action_state.get(transcript_state_id)
+                if state is not None and not state.get("message_ids"):
+                    self._transcript_action_state.pop(transcript_state_id, None)
             safe_error = _redact_telegram_error_text(e)
             logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
             err_str = str(e).lower()
@@ -4258,6 +4673,443 @@ class TelegramAdapter(BasePlatformAdapter):
                 retryable=(is_connect_timeout or is_pool_timeout or not is_timeout),
                 error_kind=error_kind,
             )
+
+    # ------------------------------------------------------------------
+    # Agent-authored inline buttons
+    #
+    # Agents can attach an inline keyboard to any outgoing message by
+    # ending it with a ``:::buttons`` block:
+    #
+    #     :::buttons
+    #     Label shown on the button => reply payload
+    #     Just a label
+    #     :::
+    #
+    # ``:::buttons multi`` renders a multi-select keyboard: taps toggle
+    # ☐/☑ checkmarks, and Done / None resolve the prompt. On resolution
+    # the payload(s) are injected into the agent session as a normal
+    # user message (space-joined for multi-select), so the agent handles
+    # a button tap exactly like a typed reply. Payload defaults to the
+    # label when no ``=>`` is given. State is in-memory: buttons from
+    # before a gateway restart answer with an "expired" notice.
+    #
+    # See docs/telegram-agent-buttons.md.
+    # ------------------------------------------------------------------
+
+    def _split_agent_buttons_segments(self, content: str) -> List[str]:
+        """Split outgoing text so each ``:::buttons`` block gets its own message.
+
+        Telegram allows only one inline keyboard per message, so a single
+        message carrying several ``:::buttons`` blocks would render only the
+        first as buttons and leak the rest as literal text. Returns one
+        segment per block (the text since the previous block, through that
+        block), with any trailing text as a final block-less segment.
+        Returns ``[content]`` unchanged when there are zero or one blocks.
+        """
+        if ":::" not in content:
+            return [content]
+        matches = list(self._AGENT_BUTTONS_RE.finditer(content))
+        if len(matches) <= 1:
+            return [content]
+        segments: List[str] = []
+        prev = 0
+        for m in matches:
+            segments.append(content[prev:m.end()])
+            prev = m.end()
+        trailing = content[prev:]
+        if trailing.strip():
+            segments.append(trailing)
+        return segments
+
+    def _extract_agent_buttons(
+        self, content: str
+    ) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Parse and strip a ``:::buttons`` block from outgoing agent text.
+
+        Returns ``(clean_content, spec)`` where spec is ``None`` when no
+        (valid) block is present, else ``{"multi": bool, "options":
+        [(label, payload), ...]}``. A malformed block is stripped from the
+        text but produces no keyboard.
+        """
+        if ":::" not in content:
+            return content, None
+        m = self._AGENT_BUTTONS_RE.search(content)
+        if not m:
+            return content, None
+        multi = bool(m.group(1))
+        options: List[Tuple[str, str]] = []
+        for line in m.group(2).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if "=>" in line:
+                label, payload = line.split("=>", 1)
+            else:
+                label, payload = line, line  # payload defaults to the label
+            label = label.strip()[:60]  # Telegram caps button labels at 64
+            payload = payload.strip()
+            if label and payload:
+                options.append((label, payload))
+        clean = (content[: m.start()] + content[m.end():]).strip()
+        if not options:
+            logger.warning(
+                "[%s] :::buttons block had no valid options — stripped", self.name
+            )
+            return clean, None
+        return clean, {"multi": multi, "options": options[: self._AGENT_BUTTONS_MAX_OPTIONS]}
+
+    def _register_agent_buttons(self, spec: Dict[str, Any]) -> str:
+        """Store button state under a short id used in callback_data.
+
+        FIFO-capped at _AGENT_BUTTONS_MAX_STATES (mirrors WhatsApp Cloud's
+        _bounded_put pattern in gateway/platforms/whatsapp_cloud.py) — oldest
+        pending prompt evicted first. An evicted button tap degrades to the
+        "expired" reply, same as after a gateway restart.
+        """
+        while True:
+            state_id = secrets.token_hex(4)
+            if state_id not in self._agent_buttons:
+                break
+        state = dict(spec)
+        state["selected"] = set()
+        self._agent_buttons[state_id] = state
+        while len(self._agent_buttons) > self._AGENT_BUTTONS_MAX_STATES:
+            self._agent_buttons.popitem(last=False)
+        return state_id
+
+    def _agent_buttons_keyboard(self, state_id: str) -> Optional["InlineKeyboardMarkup"]:
+        """Build the (current) keyboard for a registered button state."""
+        spec = self._agent_buttons.get(state_id)
+        if not spec:
+            return None
+        rows = []
+        for idx, (label, _payload) in enumerate(spec["options"]):
+            text = label
+            if spec["multi"]:
+                mark = "☑" if idx in spec["selected"] else "☐"
+                text = f"{mark} {label}"
+            rows.append(
+                [InlineKeyboardButton(text, callback_data=f"ab:{state_id}:{idx}")]
+            )
+        if spec["multi"]:
+            rows.append([
+                InlineKeyboardButton("✅ Done", callback_data=f"ab:{state_id}:done"),
+                InlineKeyboardButton("✖ None", callback_data=f"ab:{state_id}:none"),
+            ])
+        return InlineKeyboardMarkup(rows)
+
+    async def _run_backend_command(self, command: str) -> str:
+        """Run a backend-command button payload as a subprocess, no agent turn.
+
+        AAS-88 Part 1b: a single-select ``:::buttons`` option whose payload is
+        ``cmd:<helper> [args...]`` resolves by RUNNING that helper directly
+        instead of injecting the payload into the agent session. This is how
+        Approve/Deny stay silent (no typing indicator, no session/context
+        load, no LLM turn) while Give-feedback still goes through the normal
+        inject -> handle_message() path (it must regenerate a draft).
+
+        Safety boundary: ``command`` is untrusted only in the sense that it
+        comes from server-side button state an agent authored earlier in this
+        same process — but to keep this a narrow, auditable capability (not a
+        generic shell-exec hole), the first token must name a file that:
+          - contains no path separators or ``..`` (no traversal),
+          - resolves to a REGULAR FILE directly inside ``<HERMES_HOME>/bin/``
+            (the current profile's committer helper directory — resolved from
+            the ``HERMES_HOME`` env var this gateway process was started
+            with, e.g. ``/home/ubuntu/.hermes/profiles/penny``), not any
+            subdirectory of it,
+          - is executable.
+        Anything else is refused before a subprocess is ever started. There
+        is no shell involved (``create_subprocess_exec``, not
+        ``create_subprocess_shell``), so shell metacharacters in arguments
+        cannot escape into command chaining/substitution.
+
+        Taps are serialized via ``self._backend_command_lock`` so two rapid
+        taps (e.g. approving two pieces back to back) run their committer
+        subprocesses one at a time instead of racing the same on-disk store.
+        """
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            return f"Backend command failed: could not parse command ({exc})."
+        if not argv:
+            return "Backend command failed: empty command."
+
+        helper_name, helper_args = argv[0], argv[1:]
+        if not helper_name or any(sep in helper_name for sep in ("/", "\\")) or helper_name in (".", ".."):
+            return f"Backend command failed: {helper_name!r} is not a valid helper name."
+
+        hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        bin_dir = _Path(hermes_home) / "bin"
+        try:
+            bin_dir_resolved = bin_dir.resolve()
+            helper_path = (bin_dir / helper_name).resolve()
+        except OSError as exc:
+            return f"Backend command failed: could not resolve helper path ({exc})."
+
+        if (
+            helper_path.parent != bin_dir_resolved
+            or not helper_path.is_file()
+            or not os.access(helper_path, os.X_OK)
+        ):
+            return f"Backend command failed: {helper_name!r} is not a registered committer helper."
+
+        async with self._backend_command_lock:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    str(helper_path),
+                    *helper_args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=self._BACKEND_COMMAND_TIMEOUT_SECONDS
+                )
+            except Exception as exc:
+                logger.error(
+                    "[%s] backend-command %r failed to run: %s", self.name, command, exc, exc_info=True
+                )
+                return f"Backend command failed to run: {exc}"
+
+        stdout_text = stdout_bytes.decode(errors="replace").strip()
+        stderr_text = stderr_bytes.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            logger.error(
+                "[%s] backend-command %r exited %s: %s",
+                self.name, command, proc.returncode, stderr_text[:500],
+            )
+            detail = stderr_text[:300] or stdout_text[:300] or "no output"
+            return f"Backend command failed (exit {proc.returncode}): {detail}"
+        return stdout_text or "Done."
+
+    def _summarize_backend_batch(self, commands: List[str], results: List[str]) -> str:
+        """One short line summarizing a multi-select backend-command batch.
+
+        AAS-88 incident (2026-07-15): the old code joined every command's raw
+        stdout with newlines and posted the whole thing, flooding the chat
+        with N JSON blobs. This always returns a SINGLE line: a count, plus a
+        helper-specific verb/noun when every selected command shares the same
+        (helper, subcommand) -- e.g. "Crossed off 3 reminders." -- otherwise a
+        generic "Done. N of M actions completed." Failures are folded into
+        the same line, never raised or dropped.
+        """
+        total = len(results)
+        failed = sum(1 for r in results if r.startswith("Backend command failed"))
+        succeeded = total - failed
+
+        keys = set()
+        for command in commands:
+            try:
+                argv = shlex.split(command)
+            except ValueError:
+                argv = []
+            keys.add((argv[0], argv[1]) if len(argv) > 1 else (argv[0] if argv else "", None))
+        verb_noun = self._BACKEND_COMMAND_SUMMARY_VERBS.get(next(iter(keys))) if len(keys) == 1 else None
+
+        if verb_noun:
+            verb, noun = verb_noun
+            plural = noun if succeeded == 1 else f"{noun}s"
+            if failed:
+                return f"{verb} {succeeded} of {total} {plural}, {failed} failed."
+            return f"{verb} {succeeded} {plural}."
+        if failed:
+            return f"Done. {succeeded} of {total} actions completed, {failed} failed."
+        return f"Done. {succeeded} of {total} actions completed."
+
+    async def _handle_agent_button(
+        self,
+        query: Any,
+        data: str,
+        *,
+        chat_id: Any,
+        chat_type: Any,
+        thread_id: Any,
+        user_name: Optional[str],
+    ) -> None:
+        """Handle a tap on an agent-authored button.
+
+        Single-select: injects the tapped option's payload into the agent
+        session as a normal user message. Multi-select: taps toggle the
+        selection; Done injects the space-joined payloads; None injects
+        ``none``.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid button data.")
+            return
+        _, state_id, action = parts
+
+        if chat_id is None:
+            await query.answer(text="These buttons have expired — reply by text instead.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use these buttons.")
+            return
+
+        spec = self._agent_buttons.get(state_id)
+        if spec is None:
+            await query.answer(text="These buttons have expired — reply by text instead.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        # Multi-select toggle: flip the checkmark, keep waiting for Done.
+        if spec["multi"] and action not in ("done", "none"):
+            try:
+                idx = int(action)
+            except ValueError:
+                await query.answer(text="Invalid button data.")
+                return
+            if not 0 <= idx < len(spec["options"]):
+                await query.answer(text="Invalid button data.")
+                return
+            if idx in spec["selected"]:
+                spec["selected"].discard(idx)
+            else:
+                spec["selected"].add(idx)
+            await query.answer()
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=self._agent_buttons_keyboard(state_id)
+                )
+            except Exception as exc:
+                logger.debug("[%s] agent-button toggle edit failed: %s", self.name, exc)
+            return
+
+        # Resolution: single-select tap, or multi-select Done / None.
+        if spec["multi"]:
+            if action == "none" or not spec["selected"]:
+                payload = "none"
+                chosen_labels: List[str] = []
+            else:
+                chosen = sorted(spec["selected"])
+                payload = " ".join(spec["options"][i][1] for i in chosen)
+                chosen_labels = [spec["options"][i][0] for i in chosen]
+        else:
+            try:
+                idx = int(action)
+            except ValueError:
+                await query.answer(text="Invalid button data.")
+                return
+            if not 0 <= idx < len(spec["options"]):
+                await query.answer(text="Invalid button data.")
+                return
+            payload = spec["options"][idx][1]
+            chosen_labels = [spec["options"][idx][0]]
+
+        self._agent_buttons.pop(state_id, None)
+        ack = "✅ " + (", ".join(chosen_labels) if chosen_labels else "None")
+        await query.answer(text=ack[:200])
+        # Resolution deletes the button bubble outright rather than leaving
+        # greyed-out buttons behind. Generic for any :::buttons consumer
+        # (approve/deny/give-feedback and any other single-select flow).
+        # The consuming skill is responsible for sending a fresh confirmation
+        # message describing what happened. Falls back to clearing the
+        # keyboard when delete fails, e.g. Telegram's 48h delete window.
+        try:
+            await query.delete_message()
+        except Exception as exc:
+            logger.debug(
+                "[%s] agent-button delete_message failed (state=%s), falling "
+                "back to clearing the keyboard: %s",
+                self.name, state_id, exc,
+            )
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+        # Backend-command options run their helpers directly and post ONE
+        # short summary line (AAS-88 Part 1: previously this joined every
+        # command's raw stdout and posted the whole blob, flooding the chat).
+        # For multi-select sets, every selected option must be a backend
+        # command; Done executes them in selection order, serialized through
+        # _run_backend_command's lock, without starting an agent turn.
+        if spec["multi"] and action == "done" and chosen_labels:
+            chosen_payloads = [spec["options"][i][1] for i in sorted(spec["selected"])]
+            if all(p.startswith(self._BACKEND_COMMAND_PREFIX) for p in chosen_payloads):
+                commands = [p[len(self._BACKEND_COMMAND_PREFIX):] for p in chosen_payloads]
+                results = []
+                for command in commands:
+                    logger.info(
+                        "[%s] multi backend-command button resolved (state=%s): running %r",
+                        self.name, state_id, command,
+                    )
+                    results.append(await self._run_backend_command(command))
+                summary = self._summarize_backend_batch(commands, results)
+                send_metadata = {"thread_id": str(thread_id)} if thread_id is not None else None
+                try:
+                    await self.send(str(chat_id), summary, metadata=send_metadata)
+                except Exception as exc:
+                    logger.error(
+                        "[%s] failed to post multi backend-command confirmation (state=%s): %s",
+                        self.name, state_id, exc, exc_info=True,
+                    )
+                return
+
+        # AAS-88 Part 1b: a backend-command single-select option runs
+        # directly without starting an agent turn.
+        if not spec["multi"] and payload.startswith(self._BACKEND_COMMAND_PREFIX):
+            command = payload[len(self._BACKEND_COMMAND_PREFIX):]
+            logger.info(
+                "[%s] backend-command button resolved (state=%s): running %r",
+                self.name, state_id, command,
+            )
+            confirmation = await self._run_backend_command(command)
+            send_metadata = {"thread_id": str(thread_id)} if thread_id is not None else None
+            try:
+                await self.send(str(chat_id), confirmation, metadata=send_metadata)
+            except Exception as exc:
+                logger.error(
+                    "[%s] failed to post backend-command confirmation (state=%s): %s",
+                    self.name, state_id, exc, exc_info=True,
+                )
+            return
+
+        # Synthesize an incoming message so the agent session receives the
+        # payload exactly as if the user had typed it.
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        chat_type_str = "dm"
+        raw_type = getattr(chat, "type", None)
+        if raw_type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            chat_type_str = "group"
+        elif raw_type == ChatType.CHANNEL:
+            chat_type_str = "channel"
+        source = self.build_source(
+            chat_id=str(chat_id),
+            chat_name=getattr(chat, "title", None)
+            or (getattr(chat, "full_name", None) if chat is not None else None),
+            chat_type=chat_type_str,
+            user_id=caller_id or None,
+            user_name=getattr(query.from_user, "full_name", None),
+            thread_id=str(thread_id) if thread_id is not None else None,
+        )
+        # AAS-88: mark this synthesized event so the gateway queues it after
+        # any in-flight turn instead of interrupting/steering it, regardless
+        # of busy_input_mode. Without this, rapid taps each barge in on the
+        # previous tap's commit instead of completing in order.
+        event = MessageEvent(
+            text=payload,
+            message_type=MessageType.TEXT,
+            source=source,
+            force_queue=True,
+        )
+        logger.info(
+            "[%s] agent button resolved (state=%s): injecting %r into session",
+            self.name, state_id, payload,
+        )
+        await self.handle_message(event)
 
     async def send_or_update_status(
         self,
@@ -5825,6 +6677,186 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Kanban decision cards (kb:<state_id>:cN|r|l) ---
+        if data.startswith("kb:"):
+            parts = data.split(":", 2)
+            state_id = parts[1] if len(parts) == 3 else ""
+            action = parts[2] if len(parts) == 3 else ""
+            state = self._kanban_decision_states().get(state_id)
+            query_message_id = getattr(query_message, "message_id", None)
+            if (
+                not state
+                or str(query_chat_id) != state["chat_id"]
+                or int(query_message_id or 0) != int(state.get("card_message_id") or 0)
+            ):
+                await query.answer(text="This decision was already handled or expired.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if (
+                (state.get("user_id") and caller_id != state["user_id"])
+                or not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=(
+                        str(query_chat_type) if query_chat_type is not None else None
+                    ),
+                    thread_id=(
+                        str(query_thread_id) if query_thread_id is not None else None
+                    ),
+                )
+            ):
+                await query.answer(text="You are not authorized for this decision.")
+                return
+
+            if action == "l":
+                self._drop_kanban_decision_state(state_id)
+                await query.edit_message_text(
+                    text=f"{state['text']}\n\n<i>Left waiting. Open /tasks when you are ready.</i>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+                await query.answer(text="Left for later.")
+                return
+
+            if action == "r":
+                try:
+                    prompt = await self._bot.send_message(
+                        chat_id=normalize_telegram_chat_id(query_chat_id),
+                        text="Reply to this message with your decision.",
+                        reply_markup=ForceReply(
+                            selective=True,
+                            input_field_placeholder="Type your answer…",
+                        ),
+                        **(
+                            {"message_thread_id": query_thread_id}
+                            if query_thread_id is not None
+                            else {}
+                        ),
+                        **self._notification_kwargs(None),
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] decision reply prompt failed: %s", self.name, exc)
+                    await query.answer(text="Could not open a reply prompt. Try again.")
+                    return
+                self._kanban_decision_prompt_states()[
+                    (str(query_chat_id), int(prompt.message_id))
+                ] = state_id
+                await query.answer(text="Reply below with your decision.")
+                return
+
+            if action.startswith("c") and action[1:].isdigit():
+                choice_index = int(action[1:])
+                choices = state.get("choices") or []
+                if choice_index >= len(choices):
+                    await query.answer(text="This choice is no longer available.")
+                    return
+                answer = choices[choice_index]
+                try:
+                    new_status = await asyncio.to_thread(
+                        self._answer_kanban_decision_sync,
+                        state,
+                        author=f"telegram:{caller_id}",
+                        answer=answer,
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] decision callback failed: %s", self.name, exc)
+                    await query.answer(text="Could not record that answer. Try again.")
+                    return
+                self._drop_kanban_decision_state(state_id)
+                suffix = (
+                    f"<b>Answered:</b> {_html.escape(answer)}\nResuming now."
+                    if new_status
+                    else "<i>This decision was already resolved.</i>"
+                )
+                await query.edit_message_text(
+                    text=f"{state['text']}\n\n{suffix}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+                await query.answer(
+                    text=(
+                        "Answer recorded. Work resumed."
+                        if new_status
+                        else "This decision was already handled."
+                    )
+                )
+                return
+
+            await query.answer(text="This decision action is invalid.")
+            return
+
+        # --- Transcript actions (tx:<state_id>:done) ---
+        if data.startswith("tx:"):
+            parts = data.split(":", 2)
+            state_id = parts[1] if len(parts) == 3 and parts[2] == "done" else ""
+            state = self._transcript_action_state.get(state_id)
+            query_message_id = getattr(query_message, "message_id", None)
+            if (
+                not state
+                or str(query_chat_id) != state["chat_id"]
+                or str(query_message_id) not in state.get("message_ids", [])
+            ):
+                await query.answer(text="This transcript action expired.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to dismiss this transcript.")
+                return
+
+            self._transcript_action_state.pop(state_id, None)
+            await query.answer(text="✓ Got it")
+            chat_id = normalize_telegram_chat_id(state["chat_id"])
+            transcript_message_ids = list(state.get("message_ids", []))
+            for message_id in transcript_message_ids:
+                try:
+                    await self._bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Transcript message deletion failed (non-fatal): %s",
+                        self.name,
+                        exc,
+                    )
+
+            original_message_id = state.get("original_message_id")
+            if original_message_id and original_message_id not in transcript_message_ids:
+                try:
+                    await self._bot.delete_message(
+                        chat_id=chat_id,
+                        message_id=int(original_message_id),
+                    )
+                except Exception as exc:
+                    # Permissions vary by chat type. Failure to remove the user's
+                    # recording is safe after the bot transcript is dismissed.
+                    logger.debug(
+                        "[%s] Original voice-message deletion failed (non-fatal): %s",
+                        self.name,
+                        exc,
+                    )
+            return
+
+        # --- Agent-authored buttons (ab:<state_id>:<idx|done|none>) ---
+        if data.startswith("ab:"):
+            await self._handle_agent_button(
+                query,
+                data,
+                chat_id=query_chat_id,
+                chat_type=query_chat_type,
+                thread_id=query_thread_id,
+                user_name=query_user_name,
+            )
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -7129,12 +8161,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # 9) Convert blockquotes: > at line start → protect > from escaping
         #    Handle both regular blockquotes (> text) and expandable blockquotes
         #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
+        _expandable_quote_open = False
+
         def _convert_blockquote(m):
+            nonlocal _expandable_quote_open
             prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
             content = m.group(2)
-            # Check if content ends with || (expandable blockquote end marker)
-            # In this case, preserve the trailing || unescaped for Telegram
-            if prefix.startswith('**') and content.endswith('||'):
+            if prefix.startswith('**'):
+                _expandable_quote_open = True
+            if _expandable_quote_open and content.endswith('||'):
+                _expandable_quote_open = False
                 return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
             return _ph(f'{prefix} {_escape_mdv2(content)}')
 
@@ -8062,6 +9098,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "from_user", None), "id", None),
                 getattr(getattr(msg, "chat", None), "id", None),
             )
+            return
+        if await self._consume_kanban_decision_reply(msg):
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):

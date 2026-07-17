@@ -347,6 +347,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
         "project_id": task.project_id,
+        "deployment_target": task.deployment_target,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -392,6 +393,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "deployment_target": t.deployment_target,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -687,6 +689,12 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    choices = args.get("choices")
+    if choices is not None:
+        choices = [
+            redact_sensitive_text(str(choice), force=True)
+            for choice in choices
+        ]
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -724,6 +732,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                choices=choices,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1090,6 +1099,7 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
+    deployment_target = args.get("deployment_target")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
@@ -1145,6 +1155,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
+                deployment_target=deployment_target,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1553,6 +1564,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "Omit only if none apply."
                 ),
             },
+            "choices": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 8,
+                "description": (
+                    "Optional concise answers the human can choose from. The "
+                    "Telegram decision card renders one button per unique "
+                    "choice; each label is capped at 64 characters. Omit for "
+                    "an open-ended question."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
@@ -1793,6 +1815,15 @@ KANBAN_CREATE_SCHEMA = {
                     "set, the task becomes a git worktree under the project's "
                     "primary repo with a deterministic branch (project slug + "
                     "task id), instead of a random branch."
+                ),
+            },
+            "deployment_target": {
+                "type": "string",
+                "description": (
+                    "Canonical live service/environment this task may mutate "
+                    "or restart (for example 'olympus:hermes-gateway-penny'). "
+                    "Tasks with the same value are serialized. Leave unset for "
+                    "isolated implementation worktrees."
                 ),
             },
             "triage": {

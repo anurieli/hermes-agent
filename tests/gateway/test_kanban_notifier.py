@@ -10,9 +10,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.decision_cards = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def send_kanban_decision_card(self, **kwargs):
+        self.decision_cards.append(kwargs)
 
 
 class DisconnectedAdapters(dict):
@@ -103,6 +107,48 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_kanban_notifier_sends_blocked_human_input_as_decision_card(tmp_path, monkeypatch):
+    db_path = tmp_path / "decision-card.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Choose the rollout mode",
+            assignee="penny",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            user_id="777",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Which rollout mode should I use?",
+            kind="needs_input",
+            choices=["Canary", "Full rollout"],
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    assert len(adapter.decision_cards) == 1
+    card = adapter.decision_cards[0]
+    assert card["task_id"] == tid
+    assert card["assignee"] == "penny"
+    assert card["title"] == "Choose the rollout mode"
+    assert card["reason"] == "Which rollout mode should I use?"
+    assert card["choices"] == ["Canary", "Full rollout"]
+    assert card["user_id"] == "777"
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

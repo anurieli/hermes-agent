@@ -131,18 +131,17 @@ class GatewayKanbanWatchersMixin:
         cross boards, so delivery semantics are unchanged — this is
         purely a fan-out of the single-DB poll.
         """
-        # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
-        # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
-        # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
-        # TODO: gate per-board when per-board dispatcher_owner tracking lands.
+        # Notification ownership is independent from dispatch ownership. A
+        # restart-safe deployment may run the dispatcher under its own systemd
+        # unit while the gateway still owns delivery to connected chat adapters.
         try:
             from hermes_cli.config import load_config as _load_config
         except Exception:
             logger.warning("kanban notifier: config loader unavailable; disabled")
             return
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+        env_override = os.environ.get("HERMES_KANBAN_NOTIFIER_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+            logger.info("kanban notifier: disabled via HERMES_KANBAN_NOTIFIER_IN_GATEWAY env")
             return
         try:
             cfg = _load_config()
@@ -150,9 +149,9 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        if not kanban_cfg.get("notifier_in_gateway", True):
             logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
+                "kanban notifier: disabled via config kanban.notifier_in_gateway=false"
             )
             return
         from gateway.config import Platform as _Platform
@@ -338,6 +337,7 @@ class GatewayKanbanWatchersMixin:
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        decision_card: Optional[dict[str, Any]] = None
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -366,10 +366,45 @@ class GatewayKanbanWatchersMixin:
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            block_payload = ev.payload or {}
+                            block_kind = str(block_payload.get("kind") or "needs_input")
+                            if (
+                                platform_str == "telegram"
+                                and block_kind in {"needs_input", "capability"}
+                                and task is not None
+                                and hasattr(adapter, "send_kanban_decision_card")
+                            ):
+                                workspace = Path(task.workspace_path).name if task.workspace_path else ""
+                                project_parts = [
+                                    part for part in (
+                                        board_slug if board_slug != "default" else "",
+                                        task.tenant,
+                                        workspace,
+                                    )
+                                    if part
+                                ]
+                                decision_card = {
+                                    "chat_id": sub["chat_id"],
+                                    "task_id": sub["task_id"],
+                                    "board": board_slug,
+                                    "blocked_event_id": int(ev.id),
+                                    "assignee": task.assignee or "Agent",
+                                    "title": task.title,
+                                    "reason": str(
+                                        block_payload.get("reason")
+                                        or "What should I do next?"
+                                    ),
+                                    "choices": block_payload.get("choices") or None,
+                                    "project_label": " · ".join(project_parts) or None,
+                                    "block_kind": block_kind,
+                                    "user_id": sub.get("user_id") or None,
+                                }
+                                msg = ""
+                            else:
+                                reason = ""
+                                if block_payload.get("reason"):
+                                    reason = f": {str(block_payload['reason'])[:160]}"
+                                msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -408,14 +443,26 @@ class GatewayKanbanWatchersMixin:
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if decision_card is not None:
+                            decision_card["metadata"] = metadata
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
-                            )
+                            if decision_card is not None:
+                                result = await adapter.send_kanban_decision_card(
+                                    **decision_card
+                                )
+                                if result is not None and not getattr(result, "success", True):
+                                    raise RuntimeError(
+                                        getattr(result, "error", None)
+                                        or "decision card delivery failed"
+                                    )
+                            else:
+                                await adapter.send(
+                                    sub["chat_id"], msg, metadata=metadata,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,

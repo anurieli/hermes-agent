@@ -1812,6 +1812,14 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # AAS-88: set on events synthesized from an agent-button tap
+    # (``_handle_agent_button``). Tells ``_handle_active_session_busy_message``
+    # to queue this event after the in-flight turn instead of interrupting or
+    # steering it, regardless of the session's configured busy_input_mode, so
+    # rapid taps each run to completion in order instead of one interrupting
+    # another's commit.
+    force_queue: bool = False
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins

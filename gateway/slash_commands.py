@@ -993,12 +993,24 @@ class GatewaySlashCommandsMixin:
         return await self._resume_target_allowed(source, sid, allow_override=False)
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
-        """Handle /agents command - list active agents and running tasks."""
+        """Handle /agents command - list active agents and fleet tasks."""
         from gateway.run import _AGENT_PENDING_SENTINEL
         from tools.process_registry import format_uptime_short, process_registry
 
         now = time.time()
         current_session_key = self._session_key_for_source(event.source)
+
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile_name = event.source.profile or get_active_profile_name() or "default"
+        except Exception:
+            profile_name = event.source.profile or "default"
+        profile_label = (
+            "Hermes"
+            if profile_name == "default"
+            else str(profile_name).replace("-", " ").replace("_", " ").title()
+        )
 
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
@@ -1008,13 +1020,19 @@ class GatewaySlashCommandsMixin:
             started = float(running_started.get(session_key, now))
             elapsed = max(0, int(now - started))
             is_pending = agent is _AGENT_PENDING_SENTINEL
+            session_id = "" if is_pending else str(getattr(agent, "session_id", "") or "")
+            title = None
+            if session_id and self._session_db:
+                try:
+                    title = await self._session_db.get_session_title(session_id)
+                except Exception:
+                    title = None
             agent_rows.append(
                 {
                     "session_key": session_key,
                     "elapsed": elapsed,
                     "state": t("gateway.agents.state_starting") if is_pending else t("gateway.agents.state_running"),
-                    "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
-                    "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                    "title": " ".join(str(title).split()) if title else "",
                 }
             )
 
@@ -1034,6 +1052,113 @@ class GatewaySlashCommandsMixin:
             if hasattr(t, "done") and not t.done()
         ]
 
+        kanban_rows: list[dict] = []
+        waiting_kanban_cards: list[dict] = []
+        kanban_available = True
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            def _load_kanban_tasks():
+                conn = _kb.connect()
+                try:
+                    tasks = _kb.list_tasks(conn)
+                    waiting = []
+                    platform = getattr(
+                        event.source.platform,
+                        "value",
+                        str(event.source.platform),
+                    ).lower()
+                    chat_id = str(event.source.chat_id)
+                    thread_id = str(event.source.thread_id or "")
+                    for task in tasks:
+                        if task.status != "blocked":
+                            continue
+                        subscribed = any(
+                            str(sub.get("platform") or "").lower() == platform
+                            and str(sub.get("chat_id") or "") == chat_id
+                            and str(sub.get("thread_id") or "") == thread_id
+                            for sub in _kb.list_notify_subs(conn, task.id)
+                        )
+                        if not subscribed:
+                            continue
+                        blocked_events = [
+                            item for item in _kb.list_events(conn, task.id)
+                            if item.kind == "blocked"
+                        ]
+                        if not blocked_events:
+                            continue
+                        blocked_event = blocked_events[-1]
+                        block_kind = str(
+                            (blocked_event.payload or {}).get("kind")
+                            or "needs_input"
+                        )
+                        if block_kind in {"needs_input", "capability"}:
+                            waiting.append((task, blocked_event, block_kind))
+                    return tasks, waiting
+                finally:
+                    conn.close()
+
+            active_kanban_tasks, waiting_tasks = await asyncio.to_thread(
+                _load_kanban_tasks
+            )
+            waiting_ids = {task.id for task, _, _ in waiting_tasks}
+            state_order = {"running": 0, "blocked": 1, "ready": 2}
+            active_kanban_tasks = [
+                task for task in active_kanban_tasks if task.status in state_order
+            ]
+            active_kanban_tasks.sort(key=lambda task: state_order[task.status])
+            for task in active_kanban_tasks:
+                elapsed = None
+                if task.status == "running" and task.started_at:
+                    elapsed = max(0, int(now - task.started_at))
+                kanban_rows.append(
+                    {
+                        "id": str(task.id)[:10],
+                        "title": " ".join(str(task.title).split()),
+                        "assignee": str(task.assignee or t("gateway.agents.unassigned")),
+                        "status": task.status,
+                        "elapsed": elapsed,
+                        "waiting_for_user": task.id in waiting_ids,
+                    }
+                )
+            board = _kb.get_current_board()
+            for task, blocked_event, block_kind in waiting_tasks:
+                payload = blocked_event.payload or {}
+                workspace = Path(task.workspace_path).name if task.workspace_path else ""
+                project_parts = [
+                    part for part in (
+                        board if board != "default" else "",
+                        task.tenant,
+                        workspace,
+                    )
+                    if part
+                ]
+                waiting_kanban_cards.append(
+                    {
+                        "chat_id": event.source.chat_id,
+                        "task_id": task.id,
+                        "board": board,
+                        "blocked_event_id": int(blocked_event.id),
+                        "assignee": task.assignee or "Agent",
+                        "title": task.title,
+                        "reason": str(
+                            payload.get("reason") or "What should I do next?"
+                        ),
+                        "choices": payload.get("choices") or None,
+                        "project_label": " · ".join(project_parts) or None,
+                        "block_kind": block_kind,
+                        "user_id": str(event.source.user_id or "") or None,
+                        "metadata": (
+                            {"thread_id": event.source.thread_id}
+                            if event.source.thread_id
+                            else None
+                        ),
+                    }
+                )
+        except Exception as exc:
+            kanban_available = False
+            logger.warning("agents command: Kanban lookup unavailable: %s", exc)
+
         lines = [
             t("gateway.agents.header"),
             "",
@@ -1041,13 +1166,19 @@ class GatewaySlashCommandsMixin:
         ]
 
         if agent_rows:
-            for idx, row in enumerate(agent_rows[:12], 1):
-                current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
-                sid = f" · `{row['session_id']}`" if row["session_id"] else ""
-                model = f" · `{row['model']}`" if row["model"] else ""
+            for row in agent_rows[:12]:
+                title = row["title"]
+                if not title:
+                    title = (
+                        t("gateway.agents.this_chat").lstrip(" ·")
+                        if row["session_key"] == current_session_key
+                        else t("gateway.agents.active_conversation")
+                    )
+                if len(title) > 72:
+                    title = title[:69] + "..."
                 lines.append(
-                    f"{idx}. `{row['session_key']}` · {row['state']} · "
-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
+                    f"- {profile_label} · {title} · {row['state']} · "
+                    f"{format_uptime_short(row['elapsed'])}"
                 )
             if len(agent_rows) > 12:
                 lines.append(t("gateway.agents.more", count=len(agent_rows) - 12))
@@ -1077,9 +1208,67 @@ class GatewaySlashCommandsMixin:
             ]
         )
 
-        if not agent_rows and not running_processes and not background_tasks:
+        lines.append("")
+        if kanban_available:
+            lines.append(t("gateway.agents.kanban_tasks", count=len(kanban_rows)))
+            waiting_rows = [
+                row for row in kanban_rows if row["waiting_for_user"]
+            ]
+            if waiting_rows:
+                lines.append(f"**Waiting for you:** {len(waiting_rows)}")
+                for row in waiting_rows[:8]:
+                    title = row["title"]
+                    if len(title) > 72:
+                        title = title[:69] + "..."
+                    assignee = row["assignee"].replace("-", " ").replace("_", " ").title()
+                    lines.append(f"- {assignee} · {title}")
+            for status in ("running", "blocked", "ready"):
+                rows = [
+                    row for row in kanban_rows
+                    if row["status"] == status and not row["waiting_for_user"]
+                ]
+                if not rows:
+                    continue
+                state = t(f"gateway.agents.kanban_state_{status}")
+                lines.append(f"**{state[:1].upper() + state[1:]}:** {len(rows)}")
+                for row in rows[:6]:
+                    title = row["title"]
+                    if len(title) > 72:
+                        title = title[:69] + "..."
+                    timing = ""
+                    if row["elapsed"] is not None:
+                        timing = f" · {format_uptime_short(row['elapsed'])}"
+                    assignee = row["assignee"].replace("-", " ").replace("_", " ").title()
+                    lines.append(
+                        f"- {assignee} · {title} · {state}{timing} · `{row['id']}`"
+                    )
+                if len(rows) > 6:
+                    lines.append(t("gateway.agents.more", count=len(rows) - 6))
+        else:
+            lines.append(t("gateway.agents.kanban_unavailable"))
+
+        if (
+            kanban_available
+            and not agent_rows
+            and not running_processes
+            and not background_tasks
+            and not kanban_rows
+        ):
             lines.append("")
             lines.append(t("gateway.agents.none"))
+
+        if waiting_kanban_cards and event.source.platform == Platform.TELEGRAM:
+            adapter = self._authorization_adapter(Platform.TELEGRAM, profile_name)
+            if adapter and hasattr(adapter, "send_kanban_decision_card"):
+                for card in waiting_kanban_cards[:8]:
+                    try:
+                        await adapter.send_kanban_decision_card(**card)
+                    except Exception as exc:
+                        logger.warning(
+                            "agents command: could not reissue decision card for %s: %s",
+                            card["task_id"],
+                            exc,
+                        )
 
         return "\n".join(lines)
 

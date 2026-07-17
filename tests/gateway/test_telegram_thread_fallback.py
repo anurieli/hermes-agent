@@ -76,6 +76,13 @@ _fake_telegram.Message = object
 _fake_telegram.InlineKeyboardButton = _FakeInlineKeyboardButton
 _fake_telegram.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
 _fake_telegram.InputMediaPhoto = _FakeInputMediaPhoto
+# CopyTextButton / ForceReply: added to the adapter's top-level `from telegram
+# import (...)` block for transcript-echo actions. A real ModuleType raises
+# ImportError (not AttributeError) on a missing name in that form, so without
+# these the whole import falls into the except branch and clobbers ParseMode/
+# ChatType to None for every test in this file.
+_fake_telegram.CopyTextButton = object
+_fake_telegram.ForceReply = object
 _fake_telegram_error = types.ModuleType("telegram.error")
 _fake_telegram_error.NetworkError = FakeNetworkError
 _fake_telegram_error.BadRequest = FakeBadRequest

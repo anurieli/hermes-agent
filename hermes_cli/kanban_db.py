@@ -857,6 +857,7 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    deployment_target: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -943,6 +944,9 @@ class Task:
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
+            deployment_target=(
+                row["deployment_target"] if "deployment_target" in keys else None
+            ),
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1112,6 +1116,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Canonical live service/environment touched by deploy/restart work.
+    -- At most one task for a non-NULL target may be running at a time.
+    deployment_target    TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1864,6 +1871,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
+    if "deployment_target" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "deployment_target", "deployment_target TEXT"
+        )
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -2000,6 +2011,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_deployment_target "
+        "ON tasks(deployment_target)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2408,6 +2423,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    deployment_target: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2433,6 +2449,8 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    if deployment_target is not None:
+        deployment_target = str(deployment_target).strip() or None
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2634,10 +2652,10 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, deployment_target, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2652,6 +2670,7 @@ def create_task(
                         workspace_path,
                         branch_name,
                         project_id,
+                        deployment_target,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -3481,6 +3500,52 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def find_resource_conflict(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the running task that owns this task's exclusive resource.
+
+    Deploy/restart tasks serialize by ``deployment_target``. Tasks working
+    directly in a shared ``dir`` serialize by resolved workspace path.
+    Project-scoped worktrees deliberately do not conflict.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, deployment_target "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    target = (row["deployment_target"] or "").strip()
+    if target:
+        conflict = conn.execute(
+            "SELECT id FROM tasks WHERE id != ? AND status = 'running' "
+            "AND deployment_target = ? ORDER BY started_at ASC LIMIT 1",
+            (task_id, target),
+        ).fetchone()
+        if conflict:
+            return str(conflict["id"])
+    if row["workspace_kind"] == "dir" and row["workspace_path"]:
+        try:
+            path = str(Path(row["workspace_path"]).expanduser().resolve(strict=False))
+        except OSError:
+            path = str(row["workspace_path"])
+        candidates = conn.execute(
+            "SELECT id, workspace_path FROM tasks "
+            "WHERE id != ? AND status = 'running' AND workspace_kind = 'dir' "
+            "AND workspace_path IS NOT NULL", (task_id,),
+        ).fetchall()
+        for candidate in candidates:
+            try:
+                candidate_path = str(
+                    Path(candidate["workspace_path"]).expanduser().resolve(strict=False)
+                )
+            except OSError:
+                candidate_path = str(candidate["workspace_path"])
+            if candidate_path == path:
+                return str(candidate["id"])
+    return None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3497,6 +3562,10 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Race-safe enforcement: this check shares the write transaction with
+        # the ready→running compare-and-swap below.
+        if find_resource_conflict(conn, task_id):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4879,6 +4948,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    choices: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -4912,6 +4982,16 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    normalized_choices: list[str] = []
+    seen_choices: set[str] = set()
+    for raw_choice in choices or ():
+        choice = " ".join(str(raw_choice).split())[:64]
+        if not choice or choice in seen_choices:
+            continue
+        seen_choices.add(choice)
+        normalized_choices.append(choice)
+        if len(normalized_choices) >= 8:
+            break
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -5073,7 +5153,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    **({"choices": normalized_choices} if normalized_choices else {}),
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -5157,6 +5242,102 @@ def promote_task(
         )
 
     return True, None
+
+
+def answer_blocked_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: str,
+    answer: str,
+    blocked_event_id: Optional[int] = None,
+) -> Optional[str]:
+    """Atomically comment on and resume a human-blocked task.
+
+    Returns the new status (``ready`` or ``todo``), or ``None`` when the task
+    was already answered / no longer blocked. The status check, comment, and
+    transition share one write transaction so duplicate Telegram callbacks
+    cannot record two answers or resume the same card twice.
+    """
+    clean_author = " ".join(str(author or "").split())
+    clean_answer = str(answer or "").strip()
+    if not clean_author:
+        raise ValueError("answer author is required")
+    if not clean_answer:
+        raise ValueError("answer text is required")
+
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'blocked'",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if blocked_event_id is not None:
+            latest_block = conn.execute(
+                "SELECT id FROM task_events "
+                "WHERE task_id = ? AND kind = 'blocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if (
+                latest_block is None
+                or int(latest_block["id"]) != int(blocked_event_id)
+            ):
+                return None
+
+        if row["current_run_id"]:
+            conn.execute(
+                """
+                UPDATE task_runs
+                   SET status = 'reclaimed', outcome = 'reclaimed',
+                       summary = COALESCE(summary, 'invariant recovery on decision answer'),
+                       ended_at = ?, claim_lock = NULL, claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ? AND ended_at IS NULL
+                """,
+                (now, int(row["current_run_id"])),
+            )
+
+        undone_parents = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parents else "ready"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status = 'blocked'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return None
+
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, clean_author, clean_answer, now),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": clean_author, "len": len(clean_answer)},
+        )
+        _append_event(
+            conn,
+            task_id,
+            "unblocked",
+            {
+                "status": new_status,
+                "answered_via": "decision_card",
+                "answered_event_id": blocked_event_id,
+            },
+        )
+        return new_status
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6053,6 +6234,10 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_resource_locked: list[tuple[str, str]] = field(default_factory=list)
+    """Ready tasks deferred because another running task owns the same
+    deployment target or shared ``dir`` workspace. Entries are
+    ``(task_id, holder_task_id)`` and do not consume failure retries."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7747,6 +7932,10 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        resource_holder = find_resource_conflict(conn, row["id"])
+        if resource_holder:
+            result.skipped_resource_locked.append((row["id"], resource_holder))
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))

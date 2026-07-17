@@ -5657,6 +5657,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return False
 
+        # --- AAS-88: agent-button taps always queue, never interrupt/steer ---
+        # _handle_agent_button synthesizes a MessageEvent with force_queue=True
+        # for every button resolution (Approve/Deny/Give-feedback). Several
+        # taps fired in quick succession must each run to completion in
+        # arrival order instead of a later tap interrupting (or steering
+        # into) an earlier tap's in-flight commit. This overrides the
+        # session's configured busy_input_mode/busy_text_mode for this event
+        # only; free-text follow-ups are unaffected.
+        demoted_for_forced_queue = bool(getattr(event, "force_queue", False))
+        if demoted_for_forced_queue and effective_mode != "queue":
+            logger.info(
+                "Demoting busy_input_mode '%s' to 'queue' for session %s "
+                "because the event requested queue-not-interrupt semantics (AAS-88)",
+                effective_mode, session_key,
+            )
+            effective_mode = "queue"
+
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
         # (sentinel) or lacks steer(), or the payload is empty, fall back
@@ -5832,6 +5849,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             message = (
                 f"⏳ Compressing context{status_detail} — your message is queued for "
                 f"when it finishes (use /stop to cancel everything)."
+            )
+        elif is_queue_mode and demoted_for_forced_queue:
+            message = (
+                f"⏳ Finishing the previous action{status_detail}, this one is queued "
+                f"right after it."
             )
         elif is_queue_mode:
             message = (
@@ -10879,10 +10901,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
                         for _tx in _successful_transcripts:
+                            _echo_content = f'🎙️ "{_tx}"'
                             try:
+                                if source.platform == Platform.TELEGRAM:
+                                    _echo_meta = dict(_echo_meta)
+                                    _echo_meta["telegram_transcript_text"] = _tx
+                                    _echo_meta["telegram_transcript_original_message_id"] = (
+                                        self._reply_anchor_for_event(event)
+                                    )
                                 await _echo_adapter.send(
                                     source.chat_id,
-                                    f'🎙️ "{_tx}"',
+                                    _echo_content,
                                     metadata=_echo_meta,
                                 )
                             except Exception as _echo_exc:
@@ -17885,6 +17914,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        compact_progress = progress_mode == "compact" and source.platform == Platform.TELEGRAM
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
         log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
@@ -17971,7 +18001,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # from the tool-progress / "⏳ Working — N min" / status-callback bubbles
         # are collected here and deleted after the final response lands.
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
-        _cleanup_progress = bool(
+        _cleanup_progress = not compact_progress and bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
         _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
@@ -18190,7 +18220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
             # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
+            if not compact_progress and msg == last_progress_msg[0]:
                 repeat_count[0] += 1
                 # Update the last line in progress_lines with a counter
                 # via a special "dedup" queue message.
@@ -18302,7 +18332,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
-            can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
+            can_edit = compact_progress or progress_grouping != "separate"  # compact always reuses one card
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
@@ -18351,6 +18381,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await adapter.edit_message(**kwargs)
 
             def _progress_text(lines: list) -> str:
+                if compact_progress:
+                    from gateway.progress_compact import render_compact_card
+                    return render_compact_card(
+                        task_label=message,
+                        latest_action=str(lines[-1]) if lines else "Starting...",
+                        action_count=len(lines),
+                        log_lines=[str(line) for line in lines],
+                    )
                 return "\n".join(str(line) for line in lines)
 
             def _split_progress_groups(lines: list) -> list[list]:
@@ -18457,6 +18495,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                        if compact_progress:
+                            continue
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
                         # starts a fresh bubble below the content. Without this,
@@ -18579,6 +18619,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                     await _roll_progress_overflow_if_needed()
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                                if compact_progress:
+                                    continue
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.

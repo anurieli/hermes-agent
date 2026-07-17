@@ -1,30 +1,20 @@
-# DEPRECATED — the kanban dispatcher now runs inside the gateway by
-# default (config key: kanban.dispatch_in_gateway, default true). To
-# migrate:
-#
-#     systemctl --user disable --now hermes-kanban-dispatcher.service
-#     # then make sure a gateway is running; e.g. a systemd user unit
-#     # for `hermes gateway start`. The gateway hosts the dispatcher.
-#
-# This unit is kept for users who truly cannot run the gateway (host
-# policy forbids long-lived services, etc.). It now invokes the
-# standalone dispatcher via the explicit --force flag, so nobody
-# accidentally keeps two dispatchers racing against the same
-# kanban.db. Running this unit AND a gateway with
-# dispatch_in_gateway=true is NOT supported.
-
 [Unit]
-Description=Hermes Kanban dispatcher (DEPRECATED standalone daemon — prefer gateway-embedded dispatch)
+Description=Hermes Kanban dispatcher (restart-safe independent supervisor)
 Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env hermes kanban daemon --force --interval 60 --pidfile %t/hermes-kanban-dispatcher.pid
-Restart=on-failure
-RestartSec=5
-# Log to the journal via stdout/stderr; the dispatcher also writes per-task
-# worker output to $HERMES_HOME/kanban/logs/<task>.log.
+# This unit is the dispatch owner. Set kanban.dispatch_in_gateway=false in
+# config.yaml; the gateway may keep kanban.notifier_in_gateway=true.
+ExecStart=/usr/bin/env hermes kanban daemon --force --interval 10 --pidfile %t/hermes-kanban-dispatcher.pid
+Restart=always
+RestartSec=2
+# Workers are child processes but own durable task_runs rows/checkpoints. Stop
+# or restart only the daemon main process; in-flight workers remain alive and
+# are rediscovered from their persisted PID/run metadata by the new daemon.
+KillMode=process
+TimeoutStopSec=15
 StandardOutput=journal
 StandardError=journal
 

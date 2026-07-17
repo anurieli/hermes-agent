@@ -346,6 +346,176 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agents_command_uses_human_readable_live_session_title(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = MagicMock(session_id="sess-live")
+    running_agent.get_activity_summary.return_value = {
+        "seconds_since_activity": 0,
+        "last_activity_desc": "working",
+        "api_call_count": 1,
+        "max_iterations": 10,
+    }
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+    runner._running_agents_ts = {build_session_key(_make_source()): time.time() - 65}
+    runner._background_tasks = set()
+    runner._session_db._db.get_session_title.return_value = "Adding transcript action buttons"
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "penny")
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.list_sessions", lambda: []
+    )
+    monkeypatch.setattr("hermes_cli.kanban_db.list_tasks", lambda _conn: [])
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "Penny · Adding transcript action buttons · running · 1m" in result
+    assert build_session_key(_make_source()) not in result
+    assert "sess-live" not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_empty_kanban_state(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.list_sessions", lambda: []
+    )
+    monkeypatch.setattr("hermes_cli.kanban_db.list_tasks", lambda _conn: [])
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Kanban work:** 0" in result
+    assert "No active agents or running tasks." in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_orders_and_formats_active_kanban_work(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.list_sessions", lambda: []
+    )
+    tasks = [
+        SimpleNamespace(
+            id="t_ready1234", title="Queued task", assignee="maya",
+            status="ready", started_at=None,
+        ),
+        SimpleNamespace(
+            id="t_done12345", title="Done task", assignee="penny",
+            status="done", started_at=None,
+        ),
+        SimpleNamespace(
+            id="t_block1234", title="Needs input", assignee="coach",
+            status="blocked", started_at=None,
+        ),
+        SimpleNamespace(
+            id="t_run123456", title="Running task", assignee="penny",
+            status="running", started_at=time.time() - 125,
+        ),
+    ]
+    monkeypatch.setattr("hermes_cli.kanban_db.list_tasks", lambda _conn: tasks)
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Kanban work:** 3" in result
+    assert result.index("**Running:**") < result.index("**Waiting for input:**") < result.index("**Queued:**")
+    assert result.index("Running task") < result.index("Needs input") < result.index("Queued task")
+    assert "Penny · Running task · running · 2m" in result
+    assert "Coach · Needs input · waiting for input" in result
+    assert "Maya · Queued task · queued" in result
+    assert "`t_run12345`" in result
+    assert "Done task" not in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_truncates_kanban_section(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.list_sessions", lambda: []
+    )
+    tasks = [
+        SimpleNamespace(
+            id=f"t_{idx:08d}", title=f"Task {idx}", assignee="penny",
+            status="ready", started_at=None,
+        )
+        for idx in range(11)
+    ]
+    monkeypatch.setattr("hermes_cli.kanban_db.list_tasks", lambda _conn: tasks)
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "**Kanban work:** 11" in result
+    assert "Task 5" in result
+    assert "Task 6" not in result
+    assert "... and 5 more" in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_isolates_kanban_lookup_failure(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.list_sessions", lambda: []
+    )
+
+    def _fail_connect():
+        raise OSError("board offline")
+
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", _fail_connect)
+
+    result = await runner._handle_message(_make_event("/tasks"))
+
+    assert "Active Agents & Tasks" in result
+    assert "**Active agents:** 0" in result
+    assert "**Kanban work:** unavailable" in result
+
+
+@pytest.mark.asyncio
 async def test_handle_message_persists_agent_token_counts(monkeypatch):
     import gateway.run as gateway_run
 

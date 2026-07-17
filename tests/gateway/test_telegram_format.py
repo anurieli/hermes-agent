@@ -503,6 +503,12 @@ class TestFormatMessageBlockquote:
         assert "\\*" not in result  # asterisks in prefix must not be escaped
         assert "\\>" not in result  # > in prefix must not be escaped
 
+    def test_multiline_expandable_blockquote_preserves_last_line_marker(self, adapter):
+        result = adapter.format_message("**> First action\n> Second action\n> Third action||")
+        assert result.startswith("**>")
+        assert result.endswith("Third action||")
+        assert "\\|\\|" not in result
+
     def test_single_asterisk_gt_not_blockquote(self, adapter):
         """Single asterisk before > should not be treated as blockquote prefix."""
         result = adapter.format_message("*> not a quote")

@@ -1107,7 +1107,9 @@ kanban task.
 - **Dispatcher:** long-lived loop that (default every 60s) reclaims
   stale claims, promotes ready tasks, atomically claims, and spawns
   assigned profiles. Runs **inside the gateway** by default via
-  `kanban.dispatch_in_gateway: true`.
+  `kanban.dispatch_in_gateway: true`. Production gateways that must restart
+  without interrupting workers should use the independent systemd unit in
+  `docs/user-guide/features/kanban-restart-safety.md`.
 - **Plugin assets:** `plugins/kanban/dashboard/` (web UI) +
   `plugins/kanban/systemd/` (`hermes-kanban-dispatcher.service` for
   standalone dispatcher deployment).

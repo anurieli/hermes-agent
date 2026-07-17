@@ -169,6 +169,15 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     fake_adapter = MagicMock()
     fake_adapter.send = AsyncMock(side_effect=_capture_send)
+    # This test exercises the plain-text blocked notification path, not
+    # Kanban decision cards (covered separately in
+    # test_telegram_kanban_decision_cards.py). A bare MagicMock auto-invents
+    # any attribute access, so hasattr(adapter, "send_kanban_decision_card")
+    # would spuriously return True and reroute needs_input/capability blocks
+    # into the decision-card branch instead of a plain send(). Delete it so
+    # this fake adapter genuinely lacks that capability, matching adapters
+    # that don't support decision cards.
+    del fake_adapter.send_kanban_decision_card
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
     _orig_sleep = asyncio.sleep
