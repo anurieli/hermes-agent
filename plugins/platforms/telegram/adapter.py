@@ -4930,8 +4930,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         Single-select: injects the tapped option's payload into the agent
         session as a normal user message. Multi-select: taps toggle the
-        selection; Done injects the space-joined payloads; None injects
-        ``none``.
+        selection; Done injects the space-joined selected payloads. Empty
+        Done / None resolves the prompt without injecting an agent turn.
         """
         parts = data.split(":", 2)
         if len(parts) != 3:
@@ -5028,6 +5028,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
+
+        # An empty multi-select resolution is complete at the UI layer. Do
+        # not synthesize a bare ``none`` message: in a long-lived DM it is
+        # ambiguous and can make the active agent answer unrelated stale
+        # context. The callback acknowledgement above is the deterministic
+        # user-visible confirmation.
+        if spec["multi"] and (action == "none" or not spec["selected"]):
+            return
 
         # Backend-command options run their helpers directly and post ONE
         # short summary line (AAS-88 Part 1: previously this joined every

@@ -253,12 +253,27 @@ async def test_multi_select_toggle_then_done():
         {"multi": True, "options": [("A", "1"), ("B", "2"), ("C", "3")]}
     )
 
-    with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-        await _dispatch(adapter, _make_query(data=f"ab:{sid}:0"))
-        await _dispatch(adapter, _make_query(data=f"ab:{sid}:2"))
+    toggle_snapshots = []
+    original_keyboard = adapter._agent_buttons_keyboard
+
+    def capture_keyboard(state_id):
+        toggle_snapshots.append(set(adapter._agent_buttons[state_id]["selected"]))
+        return original_keyboard(state_id)
+
+    first_toggle = _make_query(data=f"ab:{sid}:0")
+    second_toggle = _make_query(data=f"ab:{sid}:2")
+    with (
+        patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False),
+        patch.object(adapter, "_agent_buttons_keyboard", side_effect=capture_keyboard),
+    ):
+        await _dispatch(adapter, first_toggle)
+        await _dispatch(adapter, second_toggle)
         # Toggles keep state alive and don't inject anything
         adapter.handle_message.assert_not_awaited()
         assert adapter._agent_buttons[sid]["selected"] == {0, 2}
+        assert toggle_snapshots == [{0}, {0, 2}]
+        first_toggle.edit_message_reply_markup.assert_awaited_once()
+        second_toggle.edit_message_reply_markup.assert_awaited_once()
 
         await _dispatch(adapter, _make_query(data=f"ab:{sid}:done"))
 
@@ -276,30 +291,36 @@ async def test_multi_select_toggle_off():
         {"multi": True, "options": [("A", "1"), ("B", "2")]}
     )
 
+    done_query = _make_query(data=f"ab:{sid}:done")
     with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
         await _dispatch(adapter, _make_query(data=f"ab:{sid}:0"))
         await _dispatch(adapter, _make_query(data=f"ab:{sid}:0"))  # toggle off
         assert adapter._agent_buttons[sid]["selected"] == set()
-        await _dispatch(adapter, _make_query(data=f"ab:{sid}:done"))
+        await _dispatch(adapter, done_query)
 
-    # Done with nothing selected == none
-    event = adapter.handle_message.await_args.args[0]
-    assert event.text == "none"
+    # Empty Done resolves visibly but must not inject an ambiguous bare
+    # "none" into the long-lived agent conversation.
+    adapter.handle_message.assert_not_awaited()
+    done_query.answer.assert_awaited_once_with(text="✅ None")
+    done_query.delete_message.assert_awaited_once()
+    assert sid not in adapter._agent_buttons
 
 
 @pytest.mark.asyncio
-async def test_multi_select_none_button():
+async def test_multi_select_none_button_acknowledges_without_agent_turn():
     adapter = _make_adapter()
     adapter.handle_message = AsyncMock()
     sid = adapter._register_agent_buttons(
         {"multi": True, "options": [("A", "1"), ("B", "2")]}
     )
 
+    query = _make_query(data=f"ab:{sid}:none")
     with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-        await _dispatch(adapter, _make_query(data=f"ab:{sid}:none"))
+        await _dispatch(adapter, query)
 
-    event = adapter.handle_message.await_args.args[0]
-    assert event.text == "none"
+    adapter.handle_message.assert_not_awaited()
+    query.answer.assert_awaited_once_with(text="✅ None")
+    query.delete_message.assert_awaited_once()
     assert sid not in adapter._agent_buttons
 
 

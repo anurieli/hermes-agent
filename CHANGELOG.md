@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-21
+
+- Fixed empty Telegram multi-select Done/None actions leaking a bare `none` into the active agent conversation. They now acknowledge and dismiss deterministically without generating an unrelated agent turn; selected actions retain their existing behavior. Added callback and selection-render regression coverage.
+
 ## 2026-07-16
 
 - Added restart-safe Kanban supervision for production gateways: an independent systemd dispatcher preserves in-flight workers across gateway/dispatcher restarts, notifier ownership is independently configurable, task filing records idempotency/project/repository/deployment metadata, and transactional resource locks serialize shared checkouts and live deployment targets without consuming retry budget.
