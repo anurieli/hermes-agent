@@ -69,12 +69,20 @@ _RAISE = object()  # sentinel: make conversations.history raise (fetch failure)
 
 @pytest.fixture()
 def adapter():
-    config = PlatformConfig(enabled=True, token="xoxb-fake-token")
+    config = PlatformConfig(
+        enabled=True,
+        token="xoxb-fake-token",
+        extra={"allowed_channels": []},
+    )
     a = SlackAdapter(config)
     a._app = MagicMock()
     a._app.client = AsyncMock()
     a._bot_user_id = TestReactionAddedRouting.BOT_UID
     a._team_bot_user_ids = {TestReactionAddedRouting.TEAM: TestReactionAddedRouting.BOT_UID}
+    # Keep these tests isolated from constructor or cross-module Slack state.
+    a._team_clients = {}
+    a._channel_team = {}
+    a._user_name_cache = {}
     a._running = True
     a.handle_message = AsyncMock()
     return a
