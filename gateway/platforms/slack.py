@@ -1371,6 +1371,10 @@ class SlackAdapter(BasePlatformAdapter):
         cache_key = f"{effective_team}:{user_id}" if effective_team else user_id
         if cache_key in self._user_name_cache:
             return self._user_name_cache[cache_key]
+        # Preserve compatibility with callers/tests that pre-populate the
+        # historical unscoped cache. New API results remain workspace-scoped.
+        if effective_team and user_id in self._user_name_cache:
+            return self._user_name_cache[user_id]
 
         if not self._app:
             return user_id
@@ -2299,6 +2303,45 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return False
 
+    async def _resolve_reacting_human(
+        self,
+        user_id: str,
+        *,
+        team_id: str,
+        client: Any,
+    ) -> Optional[str]:
+        """Verify a reaction actor is human and return their display name."""
+        if not user_id or client is None:
+            return None
+        try:
+            result = await client.users_info(user=user_id)
+            user = (result.get("user") or {}) if result else {}
+        except Exception as exc:
+            logger.debug(
+                "[Slack] users.info failed for reaction actor %s: %s", user_id, exc,
+            )
+            return None
+
+        if (
+            str(user.get("id", "")) != str(user_id)
+            or user.get("is_bot")
+            or user.get("is_app_user")
+            or user.get("deleted")
+        ):
+            return None
+
+        profile = user.get("profile") or {}
+        name = (
+            profile.get("display_name")
+            or profile.get("real_name")
+            or user.get("real_name")
+            or user.get("name")
+            or user_id
+        )
+        cache_key = f"{team_id}:{user_id}" if team_id else user_id
+        self._user_name_cache[cache_key] = name
+        return name
+
     async def _handle_reaction_added(
         self,
         event: dict,
@@ -2449,13 +2492,17 @@ class SlackAdapter(BasePlatformAdapter):
         reacted_text = reacted_msg.get("text") or None
         root_thread_ts = item_ts
 
-        user_name = await self._resolve_user_name(
+        user_name = await self._resolve_reacting_human(
             reacting_user,
-            chat_id=channel_id,
             team_id=team_id,
             client=client,
         )
-        actor = user_name or reacting_user
+        if user_name is None:
+            logger.debug(
+                "[Slack] Reaction actor %s is not a verified human", reacting_user,
+            )
+            return
+        actor = user_name
 
         text = (
             f"[Slack reaction] {actor} reacted with :{emoji}: to your "

@@ -149,10 +149,22 @@ class TestReactionAddedRouting:
         client.conversations_info = AsyncMock(
             return_value={"channel": {"is_im": is_dm, "is_mpim": is_mpim}},
         )
+
+        async def human_lookup(*, user):
+            return {
+                "user": {
+                    "id": user,
+                    "is_bot": False,
+                    "is_app_user": False,
+                    "deleted": False,
+                    "profile": {"display_name": "Human"},
+                },
+            }
+
+        client.users_info = AsyncMock(side_effect=human_lookup)
         return client
 
     async def _run(self, adapter, event, *, client, body=None, context=None):
-        adapter._resolve_user_name = AsyncMock(return_value="Human")
         await adapter._handle_reaction_added(
             event,
             body=body if body is not None else self._body(),
@@ -285,6 +297,36 @@ class TestReactionAddedRouting:
         await self._run(
             adapter, self._reaction_event(user=self.BOT_UID), client=client,
         )
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_bot_reaction_ignored(self, adapter):
+        """A different bot in the same workspace cannot wake the agent."""
+        client = self._client(
+            history_message={"ts": self.MSG_TS, "user": self.BOT_UID, "bot_id": "B1"},
+        )
+        client.users_info = AsyncMock(
+            return_value={
+                "user": {
+                    "id": "U_OTHER_BOT",
+                    "is_bot": True,
+                    "profile": {"display_name": "Other bot"},
+                },
+            },
+        )
+        await self._run(
+            adapter, self._reaction_event(user="U_OTHER_BOT"), client=client,
+        )
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_actor_lookup_failure_ignored(self, adapter):
+        """An unverifiable reaction actor fails closed."""
+        client = self._client(
+            history_message={"ts": self.MSG_TS, "user": self.BOT_UID, "bot_id": "B1"},
+        )
+        client.users_info = AsyncMock(side_effect=Exception("no users scope"))
+        await self._run(adapter, self._reaction_event(), client=client)
         adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
