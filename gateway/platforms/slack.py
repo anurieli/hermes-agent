@@ -265,6 +265,13 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+# The single reaction that wakes the agent. Only a human :white_check_mark: on a
+# bot-authored, top-level root message is treated as an explicit signal. The
+# transport stays profile-independent: it delivers the reaction with its emoji
+# preserved and lets each profile's policy decide what the signal means.
+_REACTION_TRIGGER_EMOJI = "white_check_mark"
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -585,6 +592,23 @@ class SlackAdapter(BasePlatformAdapter):
             @self._app.event("app_mention")
             async def handle_app_mention(event, say):
                 await self._handle_slack_message(event)
+
+            # Inbound reactions on the bot's own messages. When a human adds a
+            # :white_check_mark: reaction to a top-level message Hermes posted,
+            # wake the agent in that message's thread so profile policy can
+            # treat the reaction as an explicit signal. Bolt supplies the outer
+            # envelope (``body``), the workspace-scoped ``context`` (bot
+            # identity + team), and the installation ``client`` so routing,
+            # dedup, and bot-authorship verification stay workspace-safe.
+            # Reactions on messages the bot did not author, non-check-mark
+            # reactions, and thread-reply targets are ignored; see
+            # _handle_reaction_added. Requires the reactions:read scope and the
+            # reaction_added bot event (both in the generated manifest).
+            @self._app.event("reaction_added")
+            async def handle_reaction_added(event, body, context, client):
+                await self._handle_reaction_added(
+                    event, body=body, context=context, client=client,
+                )
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
@@ -1332,19 +1356,28 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- User identity resolution -----
 
-    async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:
+    async def _resolve_user_name(
+        self,
+        user_id: str,
+        chat_id: str = "",
+        *,
+        team_id: str = "",
+        client: Any = None,
+    ) -> str:
         """Resolve a Slack user ID to a display name, with caching."""
         if not user_id:
             return ""
-        if user_id in self._user_name_cache:
-            return self._user_name_cache[user_id]
+        effective_team = team_id or self._channel_team.get(chat_id, "")
+        cache_key = f"{effective_team}:{user_id}" if effective_team else user_id
+        if cache_key in self._user_name_cache:
+            return self._user_name_cache[cache_key]
 
         if not self._app:
             return user_id
 
         try:
-            client = self._get_client(chat_id) if chat_id else self._app.client
-            result = await client.users_info(user=user_id)
+            api = client or (self._get_client(chat_id) if chat_id else self._app.client)
+            result = await api.users_info(user=user_id)
             user = result.get("user", {})
             # Prefer display_name → real_name → user_id
             profile = user.get("profile", {})
@@ -1355,11 +1388,11 @@ class SlackAdapter(BasePlatformAdapter):
                 or user.get("name")
                 or user_id
             )
-            self._user_name_cache[user_id] = name
+            self._user_name_cache[cache_key] = name
             return name
         except Exception as e:
             logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
-            self._user_name_cache[user_id] = user_id
+            self._user_name_cache[cache_key] = user_id
             return user_id
 
     async def send_image_file(
@@ -2193,6 +2226,271 @@ class SlackAdapter(BasePlatformAdapter):
         _should_react = (is_dm or is_mentioned) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(ts)
+
+        await self.handle_message(msg_event)
+
+    # ----- Inbound reaction routing -----
+
+    async def _fetch_reacted_message(
+        self, channel_id: str, message_ts: str, client: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the exact top-level message a reaction was added to.
+
+        Uses ``conversations.history`` with a ``latest``/``oldest`` window
+        pinned to the message ts (inclusive, limit 1) on the workspace-scoped
+        *client* so the author check and thread verification run against the
+        installation that received the event. Returns the message dict ONLY
+        when its ``ts`` matches *message_ts* exactly; otherwise returns
+        ``None`` so callers fail closed. ``conversations.history`` never
+        surfaces thread replies, so a reaction on an in-thread reply also
+        yields ``None`` (correctly rejected; only top-level roots qualify).
+        """
+        if not channel_id or not message_ts:
+            return None
+        api = client or self._get_client(channel_id)
+        if api is None:
+            return None
+        try:
+            result = await api.conversations_history(
+                channel=channel_id,
+                latest=message_ts,
+                oldest=message_ts,
+                inclusive=True,
+                limit=1,
+            )
+            messages = result.get("messages", []) if result else []
+            for msg in messages:
+                if str(msg.get("ts", "")) == str(message_ts):
+                    return msg
+            # No exact-ts match (deleted, thread reply, or missing scope):
+            # fail closed rather than trusting an adjacent message.
+            return None
+        except Exception as exc:
+            logger.debug(
+                "[Slack] Failed to fetch reacted message %s/%s: %s",
+                channel_id, message_ts, exc,
+            )
+            return None
+
+    async def _classify_reaction_channel(
+        self, channel_id: str, client: Any = None,
+    ) -> bool:
+        """Best-effort: is *channel_id* a DM or MPIM (group DM)?
+
+        Reaction events don't carry ``channel_type``, so we ask the
+        workspace-scoped client. Direct-message ids start with ``D``; MPIMs and
+        private channels both start with ``G`` and are only distinguishable via
+        ``conversations.info``. Falls back to the id prefix when the lookup
+        fails so a transient API error can't misclassify (and, e.g., wrongly
+        subject a DM to the channel whitelist).
+        """
+        if str(channel_id).startswith("D"):
+            return True
+        api = client or self._get_client(channel_id)
+        if api is None:
+            return False
+        try:
+            info = await api.conversations_info(channel=channel_id)
+            ch = (info.get("channel") or {}) if info else {}
+            return bool(ch.get("is_im") or ch.get("is_mpim"))
+        except Exception as exc:
+            logger.debug(
+                "[Slack] conversations.info failed for %s: %s", channel_id, exc,
+            )
+            return False
+
+    async def _handle_reaction_added(
+        self,
+        event: dict,
+        *,
+        body: Optional[dict] = None,
+        context: Any = None,
+        client: Any = None,
+    ) -> None:
+        """Route a human :white_check_mark: on a bot-authored root as a synthetic message.
+
+        Only one narrow signal wakes the agent: a human adding
+        :white_check_mark: to a *top-level* message THIS workspace's bot posted.
+        We then dispatch a normalized synthetic user ``MessageEvent`` through the
+        same callback regular messages use, so the agent wakes in that exact
+        thread and the profile's policy decides what the reaction means. The
+        transport stays profile-independent: the emoji is preserved in the
+        delivered text rather than being interpreted here.
+
+        Workspace safety comes from the Bolt-supplied ``body`` (outer
+        ``event_id`` for dedup), ``context`` (the installation's ``bot_user_id``
+        and ``team_id``), and ``client`` (the installation-scoped Web client used
+        for every lookup). Bot authorship is verified against that single
+        workspace bot id via an authoritative API fetch, never inferred from
+        locally recorded timestamps, cross-workspace bot ids, or the fact that
+        Hermes merely replied under a human's root.
+
+        Fails closed (ignored) for:
+          - non-check-mark reactions and non-message / malformed items;
+          - the bot's own or any other-workspace bot reactions (echo loops);
+          - duplicate deliveries (Socket Mode redelivers on reconnect);
+          - channels excluded by ``allowed_channels``;
+          - messages that can't be fetched, whose ts doesn't match exactly,
+            that are thread replies, or that this workspace bot didn't author.
+
+        Access control is unchanged: the synthetic event carries the *reacting*
+        user's id, so gateway authorization applies exactly as for a typed
+        message.
+        """
+        # Malformed / non-message reactions (file reactions carry no channel).
+        item = event.get("item") or {}
+        if not isinstance(item, dict) or item.get("type") != "message":
+            return
+        channel_id = item.get("channel", "")
+        item_ts = item.get("ts", "")
+        if not channel_id or not item_ts:
+            return
+
+        # Only :white_check_mark: is a signal. Reject every other reaction
+        # cheaply, before any dedup bookkeeping or API calls.
+        emoji = event.get("reaction", "")
+        if emoji != _REACTION_TRIGGER_EMOJI:
+            return
+
+        reacting_user = event.get("user", "")
+        if not reacting_user:
+            return
+
+        # Workspace identity comes from the Bolt context/body, not the event
+        # payload, so routing and the bot-authorship check are scoped to the
+        # installation that actually received this reaction.
+        ctx = context or {}
+        team_id = (
+            ctx.get("team_id")
+            or (body or {}).get("team_id")
+            or event.get("team")
+            or ""
+        )
+        if team_id and channel_id:
+            self._channel_team[channel_id] = team_id
+        # This adapter can load several workspace tokens into one AsyncApp. In
+        # that mode Bolt's injected client/context can still reflect the
+        # primary token, so prefer the adapter's explicit per-team mappings.
+        client = self._team_clients.get(team_id) or client or self._get_client(channel_id)
+        bot_uid = self._team_bot_user_ids.get(team_id) or ctx.get("bot_user_id")
+        if not bot_uid and not team_id:
+            bot_uid = self._bot_user_id
+        if not bot_uid:
+            return
+
+        # Ignore reactions from this installation's bot to prevent echo loops
+        # without comparing workspace-scoped user IDs across installations.
+        if reacting_user == bot_uid:
+            return
+
+        # Slack supplies the target author's user ID on reaction events. A
+        # mismatch is authoritative and lets us reject unrelated reactions
+        # before spending a history lookup. We still fetch matching targets to
+        # verify the exact root and recover its text.
+        item_user = event.get("item_user", "")
+        if item_user and item_user != bot_uid:
+            return
+
+        # Dedup on the outer event_id (stable across Socket Mode redeliveries);
+        # fall back to a composite key when it's absent.
+        event_id = (body or {}).get("event_id", "")
+        event_ts = event.get("event_ts", "")
+        dedup_key = (
+            f"slack-reaction:{team_id}:{event_id}"
+            if event_id
+            else (
+                f"slack-reaction:{team_id}:{reacting_user}:{emoji}:"
+                f"{channel_id}:{item_ts}"
+            )
+        )
+        if self._dedup.is_duplicate(dedup_key):
+            return
+
+        # Apply the channel whitelist before any dispatch. DMs/MPIMs are never
+        # filtered (mirrors _slack_allowed_channels and _handle_slack_message).
+        is_dm = await self._classify_reaction_channel(channel_id, client)
+        if not is_dm:
+            allowed_channels = self._slack_allowed_channels()
+            if allowed_channels and channel_id not in allowed_channels:
+                logger.debug(
+                    "[Slack] Ignoring reaction in non-allowed channel: %s",
+                    channel_id,
+                )
+                return
+
+        # Fetch and verify the exact target root authored by THIS workspace
+        # bot. Fail closed on any lookup failure or timestamp mismatch.
+        reacted_msg = await self._fetch_reacted_message(
+            channel_id, item_ts, client=client,
+        )
+        if reacted_msg is None:
+            logger.debug(
+                "[Slack] Reaction target %s/%s not verifiable; ignoring",
+                channel_id, item_ts,
+            )
+            return
+        if str(reacted_msg.get("ts", "")) != str(item_ts):
+            return
+        # Reject thread-reply targets: only a top-level root qualifies. A root's
+        # thread_ts is absent or equal to its own ts once it has replies.
+        msg_thread_ts = reacted_msg.get("thread_ts")
+        if msg_thread_ts and str(msg_thread_ts) != str(item_ts):
+            return
+        # Author must be this workspace's bot. A human parent root that Hermes
+        # merely replied under is NOT bot-authored and is rejected here.
+        msg_user = reacted_msg.get("user", "")
+        if not bot_uid or msg_user != bot_uid:
+            logger.debug(
+                "[Slack] Ignoring reaction on non-bot message %s/%s",
+                channel_id, item_ts,
+            )
+            return
+
+        reacted_text = reacted_msg.get("text") or None
+        root_thread_ts = item_ts
+
+        user_name = await self._resolve_user_name(
+            reacting_user,
+            chat_id=channel_id,
+            team_id=team_id,
+            client=client,
+        )
+        actor = user_name or reacting_user
+
+        text = (
+            f"[Slack reaction] {actor} reacted with :{emoji}: to your "
+            f"message in this thread. Treat this reaction as their signal and "
+            f"respond per your policy."
+        )
+
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=channel_id,
+            chat_type="dm" if is_dm else "group",
+            user_id=reacting_user,
+            user_name=user_name,
+            thread_id=root_thread_ts,
+        )
+
+        # Preserve the same per-channel policy and skill resolution that normal
+        # Slack messages receive. Include the reacted message text as reply
+        # context so a fresh gateway wake can recover tags embedded in the bot
+        # message, such as a kanban task recovery identifier.
+        from gateway.platforms.base import resolve_channel_prompt, resolve_channel_skills
+        channel_prompt = resolve_channel_prompt(self.config.extra, channel_id, None)
+        auto_skill = resolve_channel_skills(self.config.extra, channel_id, None)
+
+        msg_event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=event,
+            message_id=event_id or event_ts or item_ts,
+            reply_to_message_id=item_ts,
+            reply_to_text=reacted_text,
+            channel_prompt=channel_prompt,
+            auto_skill=auto_skill,
+        )
 
         await self.handle_message(msg_event)
 

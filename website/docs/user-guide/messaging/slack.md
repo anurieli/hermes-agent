@@ -79,6 +79,7 @@ Navigate to **Features → OAuth & Permissions** in the sidebar. Scroll to **Sco
 | `users:read` | Look up user information |
 | `files:read` | Read and download attached files, including voice notes/audio |
 | `files:write` | Upload files (images, audio, documents) |
+| `reactions:read` | Detect emoji reactions added to the bot's own messages |
 
 :::caution Missing scopes = missing features
 Without `channels:history` and `groups:history`, the bot **will not receive messages in channels** —
@@ -127,8 +128,18 @@ This step is critical — it controls what messages the bot can see.
 | `message.channels` | **Yes** | Bot receives messages in **public** channels it's added to |
 | `message.groups` | **Recommended** | Bot receives messages in **private** channels it's invited to |
 | `app_mention` | **Yes** | Prevents Bolt SDK errors when bot is @mentioned |
+| `reaction_added` | **Recommended** | Bot is notified when someone reacts to a message it posted |
 
 4. Click **Save Changes** at the bottom of the page
+
+:::tip Emoji reactions as signals
+With the `reactions:read` scope and the `reaction_added` event, adding
+`:white_check_mark:` to a top-level message Hermes posted wakes the agent in that
+message's thread. The reaction is delivered with its emoji preserved, so your
+profile's policy can decide what it means, such as approval or "go". Other emoji,
+thread-reply targets, messages the bot did not author, the bot's own reactions,
+excluded channels, and duplicate deliveries are ignored automatically.
+:::
 
 :::danger Missing event subscriptions is the #1 setup issue
 If the bot works in DMs but **not in channels**, you almost certainly forgot to add
@@ -256,6 +267,15 @@ Then in Slack:
 3. Paste the new contents of `~/.hermes/slack-manifest.json`
 4. **Save**. Slack will prompt to reinstall the app if scopes or slash
    commands changed.
+
+:::note Upgrading an existing app for emoji reactions
+The generated manifest now includes the `reactions:read` scope and the
+`reaction_added` bot event. If you set up Hermes before this feature shipped,
+regenerate and paste the manifest as above (or add the scope under **OAuth &
+Permissions** and the event under **Event Subscriptions** by hand), then
+**reinstall the app to your workspace** so the new scope takes effect. Until you
+reinstall, Slack will not deliver reaction events to the bot.
+:::
 
 ### Legacy `/hermes <subcommand>` still works
 
