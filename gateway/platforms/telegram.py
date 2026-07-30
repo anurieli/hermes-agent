@@ -3849,12 +3849,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # 9) Convert blockquotes: > at line start → protect > from escaping
         #    Handle both regular blockquotes (> text) and expandable blockquotes
         #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
+        _expandable_quote_open = False
+
         def _convert_blockquote(m):
+            nonlocal _expandable_quote_open
             prefix = m.group(1)  # >, >>, >>>, **>, or **>> etc.
             content = m.group(2)
-            # Check if content ends with || (expandable blockquote end marker)
-            # In this case, preserve the trailing || unescaped for Telegram
-            if prefix.startswith('**') and content.endswith('||'):
+            if prefix.startswith('**'):
+                _expandable_quote_open = True
+            # Telegram closes a multiline expandable quote with || on its last
+            # ordinary > line, not necessarily on the initial **> line.
+            if _expandable_quote_open and content.endswith('||'):
+                _expandable_quote_open = False
                 return _ph(f'{prefix} {_escape_mdv2(content[:-2])}||')
             return _ph(f'{prefix} {_escape_mdv2(content)}')
 
@@ -4179,6 +4185,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not update.message or not update.message.text:
             return
         if not self._should_process_message(update.message):
+            return
+
+        if await self._try_handle_kanban_decision_reply(update.message):
             return
 
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)

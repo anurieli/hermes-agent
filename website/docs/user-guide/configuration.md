@@ -1226,6 +1226,7 @@ display:
 | `new` | Tool indicator only when the tool changes |
 | `all` | Every tool call with a short preview (default) |
 | `verbose` | Full args, results, and debug logs |
+| `compact` | Telegram only: one live card with task, latest action, count, and a tap-to-expand full log |
 
 In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
 
@@ -1261,7 +1262,7 @@ display:
     signal:
       tool_progress: 'off'    # silence progress on Signal
     telegram:
-      tool_progress: verbose  # detailed progress on Telegram
+      tool_progress: compact  # one edited activity card with expandable log
     slack:
       tool_progress: 'off'    # quiet in shared Slack workspace
 ```

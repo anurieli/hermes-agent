@@ -14336,6 +14336,7 @@ class GatewayRunner:
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        compact_progress = progress_mode == "compact" and source.platform == Platform.TELEGRAM
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -14359,7 +14360,7 @@ class GatewayRunner:
         # from the tool-progress / "Still working..." / status-callback bubbles
         # are collected here and deleted after the final response lands.
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
-        _cleanup_progress = bool(
+        _cleanup_progress = not compact_progress and bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
         _cleanup_adapter = self.adapters.get(source.platform) if _cleanup_progress else None
@@ -14474,7 +14475,7 @@ class GatewayRunner:
             # Dedup: collapse consecutive identical progress messages.
             # Common with execute_code where models iterate with the same
             # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
+            if not compact_progress and msg == last_progress_msg[0]:
                 repeat_count[0] += 1
                 # Update the last line in progress_lines with a counter
                 # via a special "dedup" queue message.
@@ -14535,6 +14536,17 @@ class GatewayRunner:
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
+            def _render_progress(latest: str = "") -> str:
+                if not compact_progress:
+                    return "\n".join(progress_lines)
+                from gateway.progress_compact import render_compact_card
+                return render_compact_card(
+                    task_label=message,
+                    latest_action=latest or (progress_lines[-1] if progress_lines else "Starting..."),
+                    action_count=len(progress_lines),
+                    log_lines=progress_lines,
+                )
+
             while True:
                 try:
                     if not _run_still_current():
@@ -14570,6 +14582,8 @@ class GatewayRunner:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
                     elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                        if compact_progress:
+                            continue
                         # Content bubble just landed on the platform — close off
                         # the current tool-progress bubble so the next tool
                         # starts a fresh bubble below the content. Without this,
@@ -14605,11 +14619,12 @@ class GatewayRunner:
 
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress(msg)
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=progress_msg_id,
                             content=full_text,
+                            finalize=compact_progress,
                         )
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
@@ -14637,7 +14652,7 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
+                            full_text = _render_progress(msg)
                             result = await adapter.send(
                                 chat_id=source.chat_id,
                                 content=full_text,
@@ -14676,16 +14691,19 @@ class GatewayRunner:
                                 if progress_lines:
                                     progress_lines[-1] = f"{base_msg} (×{count + 1})"
                             elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                                if compact_progress:
+                                    continue
                                 # Content-bubble marker during drain: close off
                                 # the current progress bubble and start a fresh
                                 # one for any tool lines that arrived after.
                                 if can_edit and progress_lines and progress_msg_id:
-                                    _pending_text = "\n".join(progress_lines)
+                                    _pending_text = _render_progress()
                                     try:
                                         await adapter.edit_message(
                                             chat_id=source.chat_id,
                                             message_id=progress_msg_id,
                                             content=_pending_text,
+                                            finalize=compact_progress,
                                         )
                                     except Exception:
                                         pass
@@ -14699,12 +14717,13 @@ class GatewayRunner:
                             break
                     # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
+                        full_text = _render_progress()
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
                                 content=full_text,
+                                finalize=compact_progress,
                             )
                         except Exception:
                             pass
