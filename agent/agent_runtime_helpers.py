@@ -672,6 +672,30 @@ def strip_think_blocks(agent, content: str) -> str:
     """
     if not content:
         return ""
+    # Multimodal / content-block replies (a list of ``{type,text}`` parts)
+    # reach here from interim-display paths (e.g. an OpenRouter fallback
+    # returning structured content). Feeding a list straight into re.sub
+    # crashes the whole turn — and, because it fires on the display step of
+    # every API call, loops forever: "expected string or bytes-like object,
+    # got 'list'" (#maya-crash-loop). Flatten text parts to a plain string
+    # so the regex passes below operate on a str. Non-list, non-str content
+    # is coerced defensively rather than crashing the outer loop.
+    if not isinstance(content, str):
+        if isinstance(content, list):
+            _parts: list = []
+            for _p in content:
+                if isinstance(_p, str):
+                    if _p:
+                        _parts.append(_p)
+                elif isinstance(_p, dict):
+                    _t = _p.get("text")
+                    if isinstance(_t, str) and _t:
+                        _parts.append(_t)
+            content = "\n".join(_parts)
+        else:
+            content = str(content)
+        if not content:
+            return ""
     # 1. Closed tag pairs — case-insensitive for all variants so
     #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
     #    the unterminated-tag pass and take trailing content with them.

@@ -15434,10 +15434,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=message_id,
                 adapter=adapter,
             )
-            result = await adapter.send(
-                str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+            # Use _send_with_retry() rather than a bare adapter.send(): right
+            # after a restart the send path is commonly still "degraded"
+            # (Telegram reconnect/DNS-over-HTTPS handshake can take well
+            # past the 1s settle time above), and a bare send() has no retry
+            # of its own — so this notice was being silently dropped on every
+            # restart whenever reconnect took more than a moment (#send_path_degraded).
+            result = await adapter._send_with_retry(
+                chat_id=str(chat_id),
+                content="♻ Gateway restarted successfully. Your session continues.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
+                max_retries=4,
+                base_delay=3.0,
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
             # and returns SendResult(success=False) rather than raising, so
