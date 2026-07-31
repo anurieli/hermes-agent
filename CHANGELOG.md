@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-31
+
+- Added a self-serve "🗑 Dismiss" button for plain cron/status Telegram deliveries, gated by a `dismissible` send-metadata flag and the new `cron.dismissible_deliveries` config option (on by default). Tapping it deletes the message client-side with no agent turn; unauthorized taps are rejected and a failed delete (48h window elapsed) falls back to clearing the keyboard. Deliveries that already carry their own inline keyboard (agent-authored buttons, transcript actions) never get a redundant dismiss button. Ports pre-migration work onto the current `plugins/platforms/telegram/` adapter architecture. Updated `plugins/platforms/telegram/adapter.py`, `cron/scheduler.py`, `hermes_cli/config.py`; added `tests/gateway/test_telegram_dismiss_button.py` and dismissible-flag coverage in `tests/cron/test_scheduler.py`.
+
 ## 2026-07-21
 
 - Fixed empty Telegram multi-select Done/None actions leaking a bare `none` into the active agent conversation. They now acknowledge and dismiss deterministically without generating an unrelated agent turn; selected actions retain their existing behavior. Added callback and selection-render regression coverage.

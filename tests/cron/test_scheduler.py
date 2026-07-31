@@ -3958,6 +3958,144 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert not sent_metadata.get("direct_messages_topic_id")
 
 
+class TestDeliverResultDismissibleFlag:
+    """cron.dismissible_deliveries threads a "dismissible" flag into the live
+    adapter's send metadata so the platform adapter (Telegram) can attach a
+    self-serve "🗑 Dismiss" button to plain cron/status text deliveries.
+    See TelegramAdapter._metadata_is_dismissible / _dismiss_keyboard."""
+
+    @staticmethod
+    def _fake_run_coro(coro, _loop):
+        # Actually run the routed coroutine (router._deliver_to_platform) so
+        # the underlying adapter.send is invoked with real metadata, then wrap
+        # the real result in a completed Future (matching
+        # run_coroutine_threadsafe's return type).
+        import asyncio as _asyncio
+        from concurrent.futures import Future
+        future = Future()
+        try:
+            future.set_result(_asyncio.run(coro))
+        except BaseException as _e:  # noqa: BLE001
+            future.set_exception(_e)
+        return future
+
+    def test_dismissible_flag_threaded_into_live_adapter_metadata(self):
+        """cron.dismissible_deliveries=true adds dismissible=True to send metadata."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "usage-report",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "555"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {"wrap_response": False, "dismissible_deliveries": True}
+             }), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=self._fake_run_coro):
+            _deliver_result(
+                job,
+                "Model usage, last 24h",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert metadata.get("dismissible") is True
+
+    def test_dismissible_deliveries_false_omits_the_flag(self):
+        """Opting out via config must not attach the flag at all."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "usage-report-optout",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "555"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {"wrap_response": False, "dismissible_deliveries": False}
+             }), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=self._fake_run_coro):
+            _deliver_result(
+                job,
+                "Model usage, last 24h",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert "dismissible" not in metadata
+
+    def test_dismissible_flag_preserves_thread_id_in_metadata(self):
+        """The dismissible flag must not clobber the existing thread_id key."""
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "topic-usage-report",
+            "deliver": "origin",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-1001",
+                "thread_id": "17585",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {"wrap_response": False, "dismissible_deliveries": True}
+             }), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=self._fake_run_coro):
+            _deliver_result(
+                job,
+                "Model usage, last 24h",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        metadata = adapter.send.call_args.kwargs["metadata"]
+        assert metadata.get("dismissible") is True
+        assert metadata.get("thread_id") == "17585"
+
+
 class TestDeliverResultLiveAdapterUnconfirmed:
     """Regression for #47056.
 

@@ -1483,9 +1483,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # in config.yaml for clean output.
     wrap_response = True
     user_cfg = None
+    # Attach a self-serve "🗑 Dismiss" button to plain cron text deliveries so
+    # read-once status pings can be cleared with one tap. Consumed only by the
+    # Telegram adapter (see TelegramAdapter._metadata_is_dismissible); other
+    # platforms ignore the flag. Deliveries that carry their own inline
+    # keyboard never receive a redundant dismiss button (adapter-side
+    # precedence — see TelegramAdapter.send).
+    dismissible_deliveries = True
     try:
         user_cfg = load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        dismissible_deliveries = user_cfg.get("cron", {}).get("dismissible_deliveries", True)
     except Exception:
         pass
 
@@ -1716,6 +1724,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if dismissible_deliveries:
+                # Thread the flag through so the platform adapter can attach a
+                # dismiss button. Text-only deliveries are the target — media
+                # attachments reuse this metadata but only the text send builds
+                # the keyboard (see TelegramAdapter.send).
+                route_metadata = dict(route_metadata)
+                route_metadata["dismissible"] = True
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.

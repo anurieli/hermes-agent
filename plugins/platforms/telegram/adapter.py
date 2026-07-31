@@ -442,6 +442,13 @@ def check_telegram_requirements() -> bool:
 # when it appears outside a code span or fenced code block.
 _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
 
+# Callback payload for the built-in "🗑 Dismiss" button attached to dismissible
+# deliveries (e.g. cron status pings).  It is a fixed sentinel — NOT a prefixed
+# ``kb:``/``tx:``/``ab:``/``ea:`` state-backed payload — so
+# ``_handle_callback_query`` deletes the message client-side with no agent
+# turn, subprocess, or session injection.
+_DISMISS_CALLBACK_DATA = "dismiss"
+
 
 def _escape_mdv2(text: str) -> str:
     """Escape Telegram MarkdownV2 special characters with a preceding backslash."""
@@ -4053,6 +4060,29 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return InlineKeyboardMarkup(rows)
 
+    @staticmethod
+    def _metadata_is_dismissible(metadata: Optional[Dict[str, Any]]) -> bool:
+        """Return whether a send was flagged as dismissible by the delivery path.
+
+        Set by cron/status deliveries (see ``cron.dismissible_deliveries`` in
+        ``cron/scheduler.py``) so read-once informational messages arrive with
+        a self-serve delete button.
+        """
+        return bool((metadata or {}).get("dismissible"))
+
+    @staticmethod
+    def _dismiss_keyboard() -> "InlineKeyboardMarkup":
+        """Build the single-button "🗑 Dismiss" inline keyboard.
+
+        The button carries the fixed :data:`_DISMISS_CALLBACK_DATA` sentinel
+        that ``_handle_callback_query`` recognises as a built-in "delete this
+        message" action — no agent turn, no state lookup, no session
+        injection.
+        """
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗑 Dismiss", callback_data=_DISMISS_CALLBACK_DATA)]]
+        )
+
     def _kanban_decision_states(self) -> "OrderedDict[str, Dict[str, Any]]":
         states = getattr(self, "_kanban_decision_state", None)
         if states is None:
@@ -4340,6 +4370,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 transcript_text,
                 transcript_state_id,
             )
+
+        # Self-serve "🗑 Dismiss" button for dismissible deliveries (cron/status
+        # pings). Only attached when nothing else already claimed the message's
+        # single inline keyboard slot — an explicit agent-buttons or transcript
+        # keyboard always wins so a dismissible flag never glues a redundant
+        # second control onto a message that already has its own.
+        if buttons_keyboard is None and self._metadata_is_dismissible(metadata):
+            buttons_keyboard = self._dismiss_keyboard()
 
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -6684,6 +6722,35 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Dismiss button (built-in "delete this message" action) ---
+        # Pure client-side delete: no agent turn, no state lookup, no
+        # subprocess. Attached to dismissible cron/status deliveries.
+        if data == _DISMISS_CALLBACK_DATA:
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=str(query_chat_id) if query_chat_id is not None else None,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to dismiss this message.")
+                return
+            await query.answer()
+            deleted = False
+            message_id = getattr(query_message, "message_id", None)
+            if query_chat_id is not None and message_id is not None:
+                deleted = await self.delete_message(str(query_chat_id), str(message_id))
+            if not deleted:
+                # Delete failed (48h window elapsed, or message already gone) —
+                # clear the keyboard so the button doesn't sit there uselessly,
+                # mirroring the agent-buttons/transcript resolution fallback.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            return
 
         # --- Kanban decision cards (kb:<state_id>:cN|r|l) ---
         if data.startswith("kb:"):
