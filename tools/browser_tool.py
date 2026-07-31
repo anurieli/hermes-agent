@@ -1760,6 +1760,94 @@ def _reap_orphaned_browser_sessions():
         logger.info("Reaped %d orphaned browser session(s) from previous run(s)", reaped)
 
 
+# Stale Chrome sweep thresholds. Even with _verify_reapable_browser_daemon's
+# identity/binding checks above, that whole reap path only fires when the
+# *daemon* PID is still alive to be verified and signaled. If the daemon
+# itself already died (OOM-kill, crash, hard kill/gateway restart) before
+# tearing down its own Chrome child, the code above hits the
+# ``if not _pid_exists(daemon_pid): shutil.rmtree(...); continue`` branch and
+# moves on - it never learns the Chrome PID that daemon spawned, so that
+# Chrome process is permanently invisible to everything else in this file.
+# Left alone, these accumulate until they OOM the host. See the sweep below.
+STALE_CHROME_AGE_S = env_int("BROWSER_STALE_CHROME_AGE_S", 3600)
+STALE_CHROME_CPU_S = env_int("BROWSER_STALE_CHROME_CPU_S", 180)
+
+
+def _reap_stale_agent_browser_chrome_processes():
+    """Sweep for Chrome processes abandoned by a dead ``agent-browser`` daemon.
+
+    ``_reap_orphaned_browser_sessions`` above can only reap what it can see:
+    hermes-tracked socket dirs and the daemon PID recorded in them, verified
+    live via ``_verify_reapable_browser_daemon``. It has no visibility into
+    the daemon's own Chrome child - that PID is never reported back to
+    hermes. If the daemon dies before closing Chrome, that Chrome process is
+    orphaned in a way the code above structurally cannot detect: there is no
+    daemon left alive to signal, and no record of the Chrome PID to check.
+
+    This does the only thing possible from the outside: scan for Chrome
+    processes launched with the agent-browser local-Chrome profile naming
+    convention (``--user-data-dir=.../agent-browser-chrome-<uuid>``) and
+    reap any whose age and cumulative CPU time indicate they've been sitting
+    idle far longer than a real, in-use session ever would - a genuinely
+    active session accrues CPU time from navigation/eval/rendering, and the
+    daemon's own idle-shutdown would have already closed a truly-idle-but-
+    still-owned session long before ``STALE_CHROME_AGE_S``.
+
+    Safe to call frequently and from any process - purely additive, no
+    shared state, no assumptions about which process (if any) is the owner.
+    """
+    import psutil
+
+    now = time.time()
+    reaped = 0
+    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            if not cmdline:
+                continue
+            # Only match the top-level browser process, not its own
+            # renderer/gpu-process/utility/zygote children - killing the
+            # parent's process tree below takes those out too, and matching
+            # children here would double-reap and skew the age/cpu check
+            # (children start later and accrue less CPU than the parent).
+            if any(arg.startswith("--type=") for arg in cmdline):
+                continue
+            if not any("agent-browser-chrome-" in arg for arg in cmdline if arg.startswith("--user-data-dir=")):
+                continue
+
+            age = now - proc.info["create_time"]
+            if age <= STALE_CHROME_AGE_S:
+                continue
+
+            cpu_times = proc.cpu_times()
+            cpu_time = cpu_times.user + cpu_times.system
+            if cpu_time >= STALE_CHROME_CPU_S:
+                continue  # actively doing work - not stale, leave it alone
+
+            logger.info(
+                "Reaping stale agent-browser Chrome PID %d (age=%ds, cpu=%ds, "
+                "no live agent-browser daemon left to own it)",
+                proc.pid, int(age), int(cpu_time),
+            )
+            for child in proc.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            try:
+                proc.kill()
+                reaped += 1
+            except psutil.NoSuchProcess:
+                pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except Exception as e:
+            logger.debug("Stale Chrome sweep error for pid %s: %s", getattr(proc, "pid", "?"), e)
+
+    if reaped:
+        logger.info("Reaped %d stale agent-browser Chrome process(es)", reaped)
+
+
 def _browser_cleanup_thread_worker():
     """
     Background thread that periodically cleans up inactive browser sessions.
@@ -1773,12 +1861,20 @@ def _browser_cleanup_thread_worker():
         _reap_orphaned_browser_sessions()
     except Exception as e:
         logger.warning("Orphan reap error: %s", e)
+    try:
+        _reap_stale_agent_browser_chrome_processes()
+    except Exception as e:
+        logger.warning("Stale Chrome sweep error: %s", e)
 
     while _cleanup_running:
         try:
             _cleanup_inactive_browser_sessions()
         except Exception as e:
             logger.warning("Cleanup thread error: %s", e)
+        try:
+            _reap_stale_agent_browser_chrome_processes()
+        except Exception as e:
+            logger.warning("Stale Chrome sweep error: %s", e)
 
         # Sleep in 1-second intervals so we can stop quickly if needed
         for _ in range(30):
