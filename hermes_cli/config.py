@@ -2736,6 +2736,12 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Attach a "🗑 Dismiss" button to plain cron/status text deliveries so
+        # read-once informational pings can be cleared with one tap (Telegram
+        # only).  On by default because disposable status messages are the exact
+        # pain point.  Deliveries that already carry their own inline keyboard
+        # (approval gates, Kanban decision cards) never get a redundant button.
+        "dismissible_deliveries": True,
         # Make cron deliveries CONTINUABLE: a user can reply to a cron brief
         # and the agent has it in context (no "what is Task #2?" amnesia).
         # Default False preserves the historical isolation guarantee (cron
