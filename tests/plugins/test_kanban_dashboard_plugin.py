@@ -1427,6 +1427,47 @@ def test_patch_status_archive_closes_running_run(client):
         conn.close()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc cmdline check is Linux-only")
+def test_patch_status_drag_to_ready_reaps_orphaned_worker(client):
+    """Dragging a running card straight to 'ready' on the dashboard must not
+    orphan its worker — same bug class as ``hermes kanban block`` (see
+    ``_set_status_direct`` / ``kanban_db._reap_worker_process_group``)."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "z2", "assignee": "worker"})
+    tid = r.json()["task"]["id"]
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)", "hermes", "--cli"],
+        start_new_session=True,
+    )
+    try:
+        conn = kb.connect()
+        try:
+            kb.claim_task(conn, tid)
+            kb._set_worker_pid(conn, tid, worker.pid)
+        finally:
+            conn.close()
+
+        r = client.patch(
+            f"/api/plugins/kanban/tasks/{tid}",
+            json={"status": "ready"},
+        )
+        assert r.status_code == 200, r.text
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready"
+            assert task.worker_pid is None
+        finally:
+            conn.close()
+
+        worker.wait(timeout=5)
+        assert not kb._pid_alive(worker.pid)
+    finally:
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})

@@ -644,6 +644,201 @@ def test_stale_claim_released_when_worker_not_host_local(
         assert kb.get_task(conn, t).status == "ready"
 
 
+# ---------------------------------------------------------------------------
+# Orphaned worker reaping — block_task / complete_task / archive_task /
+# schedule_task must not leave a live worker process behind when the task
+# leaves ``running``. See ``_reap_worker_process_group``. Real 2026-07-31
+# incident: orphaned workers pinned 100% of swap and drove load to 39.
+# ---------------------------------------------------------------------------
+
+def _spawn_fake_cody_worker() -> subprocess.Popen:
+    """A harmless long-lived stand-in for a real Cody worker process.
+
+    Runs in its own session/process group (so reaping it can never touch the
+    test runner) and carries ``hermes`` + ``--cli`` tokens in its argv so it
+    passes ``_cmdline_is_cody_worker``'s PID-reuse guard for real, without
+    monkeypatching that check out of the test.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)",
+         "hermes", "--cli"],
+        start_new_session=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc cmdline check is Linux-only")
+def test_block_task_reaps_orphaned_worker(kanban_home):
+    """The fix: block_task kills the worker's process group, not just the DB row."""
+    worker = _spawn_fake_cody_worker()
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="a")
+            kb.claim_task(conn, t)
+            kb._set_worker_pid(conn, t, worker.pid)
+            assert kb.block_task(conn, t, reason="need input") is True
+            assert kb.get_task(conn, t).status == "blocked"
+
+        worker.wait(timeout=5)
+        assert worker.returncode is not None
+        assert not kb._pid_alive(worker.pid)
+    finally:
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc cmdline check is Linux-only")
+def test_complete_task_reaps_orphaned_worker(kanban_home):
+    """Manual completion of a still-running task must not orphan its worker."""
+    worker = _spawn_fake_cody_worker()
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="a")
+            kb.claim_task(conn, t)
+            kb._set_worker_pid(conn, t, worker.pid)
+            assert kb.complete_task(conn, t, result="done") is True
+            assert kb.get_task(conn, t).status == "done"
+
+        worker.wait(timeout=5)
+        assert not kb._pid_alive(worker.pid)
+    finally:
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc cmdline check is Linux-only")
+def test_archive_task_reaps_orphaned_worker(kanban_home):
+    """Archiving a running task (e.g. from the dashboard) must not orphan its worker."""
+    worker = _spawn_fake_cody_worker()
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="a")
+            kb.claim_task(conn, t)
+            kb._set_worker_pid(conn, t, worker.pid)
+            assert kb.archive_task(conn, t) is True
+            assert kb.get_task(conn, t).status == "archived"
+
+        worker.wait(timeout=5)
+        assert not kb._pid_alive(worker.pid)
+    finally:
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc cmdline check is Linux-only")
+def test_schedule_task_reaps_orphaned_worker(kanban_home):
+    """Scheduling a running task must not orphan its worker."""
+    worker = _spawn_fake_cody_worker()
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="a")
+            kb.claim_task(conn, t)
+            kb._set_worker_pid(conn, t, worker.pid)
+            assert kb.schedule_task(conn, t, reason="later") is True
+            assert kb.get_task(conn, t).status == "scheduled"
+
+        worker.wait(timeout=5)
+        assert not kb._pid_alive(worker.pid)
+    finally:
+        if worker.poll() is None:
+            worker.terminate()
+            worker.wait(timeout=5)
+
+
+def test_reap_worker_process_group_noop_when_no_pid(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    info = _kb._reap_worker_process_group(None)
+    assert info["reap_attempted"] is False
+    assert info["reaped"] is False
+    assert info["reap_skipped_reason"] == "no_pid"
+
+
+def test_reap_worker_process_group_noop_when_already_dead(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=5)
+    info = _kb._reap_worker_process_group(proc.pid)
+    assert info["reap_attempted"] is False
+    assert info["reaped"] is False
+    assert info["reap_skipped_reason"] == "already_dead"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="/proc cmdline check is Linux-only")
+def test_reap_worker_process_group_refuses_pid_without_worker_cmdline(kanban_home):
+    """Guard against PID reuse: a live process whose cmdline doesn't look like
+    a Cody worker must never be killed, even though the pid is real and alive."""
+    import hermes_cli.kanban_db as _kb
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        start_new_session=True,
+    )
+    try:
+        info = _kb._reap_worker_process_group(proc.pid)
+        assert info["reap_attempted"] is False
+        assert info["reaped"] is False
+        assert info["reap_skipped_reason"] == "pid_reused"
+        assert proc.poll() is None  # left alone
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_reap_worker_process_group_refuses_to_kill_own_group(kanban_home, monkeypatch):
+    """Never kill a process group that includes the caller itself.
+
+    A ``hermes kanban`` CLI call made from inside a worker (the worker
+    blocking/completing its own task) must not commit process-group suicide.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_cmdline_is_cody_worker", lambda _pid: True)
+    killed = []
+    info = _kb._reap_worker_process_group(
+        os.getpid(), killpg_fn=lambda pgid, sig: killed.append((pgid, sig)),
+    )
+    assert info["reap_attempted"] is False
+    assert info["reaped"] is False
+    assert info["reap_skipped_reason"] == "would_kill_self"
+    assert killed == []
+
+
+def test_reap_worker_process_group_escalates_to_sigkill_when_sigterm_ignored(
+    kanban_home, monkeypatch,
+):
+    """A worker wedged past SIGTERM must still die (SIGKILL escalation)."""
+    import signal
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_cmdline_is_cody_worker", lambda _pid: True)
+    monkeypatch.setattr(_kb, "_WORKER_REAP_SIGKILL_GRACE_SECONDS", 0.2)
+    monkeypatch.setattr(_kb, "_WORKER_REAP_POLL_INTERVAL_SECONDS", 0.05)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "time.sleep(300)"],
+        start_new_session=True,
+    )
+    try:
+        assert proc.poll() is None
+        time.sleep(0.2)  # let the signal handler install
+        info = _kb._reap_worker_process_group(proc.pid)
+        proc.wait(timeout=5)
+        assert info["reap_attempted"] is True
+        assert info["reap_sigkill"] is True
+        assert info["reaped"] is True
+        assert not _kb._pid_alive(proc.pid)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch):
     """detect_stale_running must also hold the claim when the worker survives."""
     import hermes_cli.kanban_db as _kb

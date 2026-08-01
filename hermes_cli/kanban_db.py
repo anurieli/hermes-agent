@@ -4231,6 +4231,12 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        prev_worker_row = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        prev_worker_pid = (
+            prev_worker_row["worker_pid"] if prev_worker_row else None
+        )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4268,6 +4274,15 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        # The task no longer owns this worker as of the UPDATE above —
+        # reap its process group now instead of leaving it orphaned for
+        # the watchdog cron to find. See ``_reap_worker_process_group``.
+        reap_info = _reap_worker_process_group(prev_worker_pid)
+        if reap_info["reap_attempted"]:
+            _log.info(
+                "kanban complete: reaped worker pid=%s for task %s (%s)",
+                reap_info["reap_pid"], task_id, reap_info,
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -4309,6 +4324,8 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if reap_info["reap_attempted"]:
+            completed_payload["worker_reap"] = reap_info
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -4996,11 +5013,12 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, worker_pid FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
+        prev_worker_pid = cur_row["worker_pid"]
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -5030,6 +5048,15 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            # The task no longer owns this worker as of the UPDATE above —
+            # reap its process group now instead of leaving it orphaned.
+            # See ``_reap_worker_process_group``.
+            reap_info = _reap_worker_process_group(prev_worker_pid)
+            if reap_info["reap_attempted"]:
+                _log.info(
+                    "kanban block (dependency): reaped worker pid=%s for "
+                    "task %s (%s)", reap_info["reap_pid"], task_id, reap_info,
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -5041,7 +5068,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    **({"worker_reap": reap_info} if reap_info["reap_attempted"] else {}),
+                },
+                run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -5084,6 +5116,12 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            reap_info = _reap_worker_process_group(prev_worker_pid)
+            if reap_info["reap_attempted"]:
+                _log.info(
+                    "kanban block (triage): reaped worker pid=%s for task "
+                    "%s (%s)", reap_info["reap_pid"], task_id, reap_info,
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -5100,6 +5138,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    **({"worker_reap": reap_info} if reap_info["reap_attempted"] else {}),
                 },
                 run_id=run_id,
             )
@@ -5138,6 +5177,16 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            # This is the plain ``hermes kanban block <id>`` path — the one
+            # responsible for the 2026-07-31 orphan-worker incident. The
+            # worker_pid column above just went to NULL; without this, the
+            # worker process (and its tsserver child) would run forever.
+            reap_info = _reap_worker_process_group(prev_worker_pid)
+            if reap_info["reap_attempted"]:
+                _log.info(
+                    "kanban block: reaped worker pid=%s for task %s (%s)",
+                    reap_info["reap_pid"], task_id, reap_info,
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -5157,6 +5206,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
+                    **({"worker_reap": reap_info} if reap_info["reap_attempted"] else {}),
                     **({"choices": normalized_choices} if normalized_choices else {}),
                 },
                 run_id=run_id,
@@ -5722,6 +5772,12 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        prev_worker_row = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        prev_worker_pid = (
+            prev_worker_row["worker_pid"] if prev_worker_row else None
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -5730,6 +5786,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        # A task can be archived straight out of ``running`` (e.g. from the
+        # dashboard) — reap its worker's process group so archiving doesn't
+        # orphan it. See ``_reap_worker_process_group``.
+        reap_info = _reap_worker_process_group(prev_worker_pid)
+        if reap_info["reap_attempted"]:
+            _log.info(
+                "kanban archive: reaped worker pid=%s for task %s (%s)",
+                reap_info["reap_pid"], task_id, reap_info,
+            )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -5738,7 +5803,11 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(
+            conn, task_id, "archived",
+            {"worker_reap": reap_info} if reap_info["reap_attempted"] else None,
+            run_id=run_id,
+        )
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -6115,6 +6184,12 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        prev_worker_row = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        prev_worker_pid = (
+            prev_worker_row["worker_pid"] if prev_worker_row else None
+        )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -6131,6 +6206,15 @@ def schedule_task(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
+        # ``running`` is one of the eligible source statuses above, so this
+        # can orphan a live worker exactly like block_task/complete_task did.
+        # See ``_reap_worker_process_group``.
+        reap_info = _reap_worker_process_group(prev_worker_pid)
+        if reap_info["reap_attempted"]:
+            _log.info(
+                "kanban schedule: reaped worker pid=%s for task %s (%s)",
+                reap_info["reap_pid"], task_id, reap_info,
+            )
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",
@@ -6142,7 +6226,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {"reason": reason}
+        if reap_info["reap_attempted"]:
+            payload["worker_reap"] = reap_info
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 
@@ -6549,6 +6636,158 @@ def _defer_reclaim_for_live_worker(
         }
         payload.update(termination)
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+
+
+# Grace period between SIGTERM and SIGKILL when reaping an orphaned worker's
+# process group. Short on purpose: this runs synchronously inside a kanban
+# state-transition call (block/complete/archive/schedule), so it must not
+# make those calls noticeably slower than they already are.
+_WORKER_REAP_SIGKILL_GRACE_SECONDS = 3.0
+_WORKER_REAP_POLL_INTERVAL_SECONDS = 0.3
+
+
+def _cmdline_is_cody_worker(pid: int) -> Optional[bool]:
+    """Best-effort check that ``pid`` is still a Cody kanban worker process.
+
+    Reads ``/proc/<pid>/cmdline`` on Linux and looks for the argv shape the
+    dispatcher spawns workers with (``hermes -p cody ... --cli``). Returns
+    ``True``/``False`` when the check is conclusive, or ``None`` when it
+    cannot be determined at all (non-Linux, proc entry already gone,
+    permission denied).
+
+    Callers MUST treat ``None`` the same as ``False`` — i.e. do not kill.
+    PIDs get reused by the OS; killing an unrelated recycled PID because we
+    couldn't prove it *wasn't* our worker would be worse than the leak this
+    exists to fix.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            raw = f.read()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    if not raw:
+        return None
+    cmdline = raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
+    return "hermes" in cmdline and "--cli" in cmdline
+
+
+def _reap_worker_process_group(
+    pid: Optional[int],
+    *,
+    killpg_fn=None,
+) -> dict[str, Any]:
+    """Kill a worker's OS process group the moment its task leaves ``running``.
+
+    ``block_task``, ``complete_task``, ``archive_task``, and ``schedule_task``
+    all clear ``tasks.worker_pid`` in the DB but historically never signalled
+    the process itself. The worker (a full LLM context plus a per-worktree
+    ``tsserver``) kept running forever — on 2026-07-31 orphaned workers
+    pinned 100% of swap and drove load average to 39, stranding the box for
+    ~8 hours. This reaps the whole process group (SIGTERM, escalating to
+    SIGKILL) so the child ``tsserver`` dies too, right when the transition
+    happens instead of waiting on the ``cody_watchdog`` cron sweep.
+
+    Every failure mode here is deliberately non-fatal: a kanban state
+    transition (block/complete/archive/schedule) must never fail because
+    reaping a stray process didn't go cleanly. Callers should log the
+    returned info dict and move on regardless of outcome.
+
+    Guards, in order:
+
+    * no pid recorded → nothing to do.
+    * pid already dead → nothing to do.
+    * ``/proc/<pid>/cmdline`` doesn't look like a Cody worker (or can't be
+      read at all) → skip. Protects against PID reuse: a recycled pid
+      belonging to an unrelated process must never be killed.
+    * target process group is our own → skip. A ``hermes kanban`` CLI call
+      made from *inside* a worker (e.g. a worker blocking itself) must not
+      commit process-group suicide.
+    """
+    info: dict[str, Any] = {
+        "reap_attempted": False,
+        "reap_pid": int(pid) if pid else None,
+        "reaped": False,
+        "reap_sigkill": False,
+        "reap_skipped_reason": None,
+    }
+    if not pid or int(pid) <= 0:
+        info["reap_skipped_reason"] = "no_pid"
+        return info
+    pid = int(pid)
+
+    if not _pid_alive(pid):
+        info["reap_skipped_reason"] = "already_dead"
+        return info
+
+    verified = _cmdline_is_cody_worker(pid)
+    if not verified:
+        info["reap_skipped_reason"] = (
+            "pid_reused" if verified is False else "cmdline_unverifiable"
+        )
+        return info
+
+    killpg = killpg_fn if killpg_fn is not None else (
+        os.killpg if hasattr(os, "killpg") else None
+    )
+    if killpg is None:
+        info["reap_skipped_reason"] = "no_killpg"
+        return info
+
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, PermissionError, OSError):
+        info["reap_skipped_reason"] = "no_pgid"
+        return info
+
+    try:
+        my_pgid = os.getpgrp()
+    except OSError:
+        my_pgid = None
+    if my_pgid is not None and pgid == my_pgid:
+        info["reap_skipped_reason"] = "would_kill_self"
+        return info
+
+    import signal as _signal
+
+    info["reap_attempted"] = True
+    try:
+        killpg(pgid, _signal.SIGTERM)
+    except ProcessLookupError:
+        # Gone between the liveness check and the signal — a successful
+        # termination, not a failure.
+        info["reaped"] = True
+        return info
+    except PermissionError:
+        info["reap_skipped_reason"] = "permission_denied"
+        return info
+    except OSError:
+        info["reap_skipped_reason"] = "os_error"
+        return info
+
+    deadline = time.time() + _WORKER_REAP_SIGKILL_GRACE_SECONDS
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            info["reaped"] = True
+            return info
+        time.sleep(_WORKER_REAP_POLL_INTERVAL_SECONDS)
+
+    if _pid_alive(pid):
+        try:
+            killpg(pgid, _signal.SIGKILL)
+            info["reap_sigkill"] = True
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        else:
+            # SIGKILL is not instantaneous — give the kernel a beat to tear
+            # the process down before concluding it survived.
+            kill_deadline = time.time() + _WORKER_REAP_SIGKILL_GRACE_SECONDS
+            while time.time() < kill_deadline and _pid_alive(pid):
+                time.sleep(_WORKER_REAP_POLL_INTERVAL_SECONDS)
+
+    info["reaped"] = not _pid_alive(pid)
+    return info
 
 
 def heartbeat_worker(

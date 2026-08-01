@@ -992,7 +992,7 @@ def _set_status_direct(
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, worker_pid FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
@@ -1029,6 +1029,20 @@ def _set_status_direct(
         )
         if cur.rowcount != 1:
             return False
+        # Same drag-drop UPDATE above clears worker_pid whenever the move
+        # leaves 'running' — a dashboard drag of a running card is just as
+        # capable of orphaning its worker as ``kanban block`` was. Reap the
+        # process group now rather than leaving it for the watchdog cron.
+        # See ``kanban_db._reap_worker_process_group``.
+        status_payload: dict = {"status": new_status}
+        if was_running and new_status != "running":
+            reap_info = kanban_db._reap_worker_process_group(prev["worker_pid"])
+            if reap_info["reap_attempted"]:
+                log.info(
+                    "kanban dashboard status change: reaped worker pid=%s "
+                    "for task %s (%s)", reap_info["reap_pid"], task_id, reap_info,
+                )
+                status_payload["worker_reap"] = reap_info
         run_id = None
         if was_running and new_status != "running" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
@@ -1039,7 +1053,7 @@ def _set_status_direct(
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            (task_id, run_id, json.dumps(status_payload), int(time.time())),
         )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that
