@@ -1124,18 +1124,32 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _ready_counts() -> "tuple[int, int]":
+            """``(total, unguarded)`` ready+spawnable task counts, summed
+            across ALL boards.
 
+            ``total`` mirrors the old ``_ready_nonempty`` probe exactly:
+            ready+assigned+unclaimed tasks on any board whose assignee maps
+            to a real Hermes profile (i.e. ones the dispatcher would
+            actually spawn for), plus review-column tasks the same way.
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
+            ``orion-research``) are pulled by terminals via ``claim_task``
+            directly and never spawnable, so a queue full of those is
+            "correctly idle" and excluded here, same as before.
+
+            ``unguarded`` is the subset of the ready column NOT currently
+            deferred by ``check_respawn_guard`` (most commonly
+            ``active_pr`` — a worker already opened a PR and is correctly
+            waiting on human review, not stuck). This is what lets the
+            stuck-check below tell a genuinely broken dispatcher (broken
+            PATH, missing venv, credential loss) apart from one that is
+            correctly idle. Review-column tasks have no guard concept, so
+            a spawnable review task still counts toward both total and
+            unguarded, same as it always implicitly did as a boolean
+            signal — see :func:`hermes_cli.kanban_db.count_unguarded_ready`.
             """
+            total = 0
+            unguarded = 0
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -1145,10 +1159,12 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
+                    board_total, board_unguarded = _kb.count_unguarded_ready(conn)
+                    total += board_total
+                    unguarded += board_unguarded
                     if _kb.has_spawnable_review(conn):
-                        return True
+                        total += 1
+                        unguarded += 1
                 except Exception:
                     continue
                 finally:
@@ -1157,7 +1173,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return (total, unguarded)
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1298,7 +1314,8 @@ class GatewayKanbanWatchersMixin:
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
                 # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
+                total_ready, unguarded_ready = await asyncio.to_thread(_ready_counts)
+                ready_pending = total_ready > 0
                 if ready_pending and not any_spawned:
                     bad_ticks += 1
                 else:
@@ -1306,13 +1323,15 @@ class GatewayKanbanWatchersMixin:
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
-                        logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
+                        outcome = _kb.dispatcher_stuck_message(
+                            total_ready, unguarded_ready, bad_ticks,
                         )
+                        if outcome is not None:
+                            level, text = outcome
+                            if level == "warn":
+                                logger.warning("kanban dispatcher stuck: %s", text)
+                            else:
+                                logger.info("kanban dispatcher idle: %s", text)
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")

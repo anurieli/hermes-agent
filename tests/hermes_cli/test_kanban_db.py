@@ -1904,6 +1904,104 @@ def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
         assert kb.has_spawnable_ready(conn) is False
 
 
+# ---------------------------------------------------------------------------
+# count_unguarded_ready / dispatcher_stuck_message — the dispatcher health
+# telemetry used to treat "ready queue non-empty and nothing spawned" as
+# always bad, which false-alarmed every time a worker emptied its real
+# queue and was left holding PRs awaiting human review (active_pr guard).
+# These make sure the fix tells "genuinely stuck" apart from "correctly
+# idle", and specifically that a mix of the two still warns about the
+# genuinely stuck part instead of going silent. See 2026-08-01 investigation.
+# ---------------------------------------------------------------------------
+
+def test_count_unguarded_ready_all_guarded(kanban_home, all_assignees_spawnable):
+    """Every ready task guarded by active_pr -> real work exists, but none
+    of it is unguarded, so nothing should look "stuck"."""
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="pr1", assignee="alice")
+        kb.add_comment(conn, t1, "worker", "PR: https://github.com/o/r/pull/1")
+        t2 = kb.create_task(conn, title="pr2", assignee="bob")
+        kb.add_comment(conn, t2, "worker", "PR: https://github.com/o/r/pull/2")
+        total, unguarded = kb.count_unguarded_ready(conn)
+    assert total == 2
+    assert unguarded == 0
+
+
+def test_count_unguarded_ready_none_guarded(kanban_home, all_assignees_spawnable):
+    """A plain ready task with no guard trigger counts as unguarded."""
+    with kb.connect() as conn:
+        kb.create_task(conn, title="plain", assignee="alice")
+        total, unguarded = kb.count_unguarded_ready(conn)
+    assert total == 1
+    assert unguarded == 1
+
+
+def test_count_unguarded_ready_mixed(kanban_home, all_assignees_spawnable):
+    """Mixed case: one task guarded by active_pr, one genuinely stuck.
+
+    This is the case that matters most — a naive fix that only checks
+    "did any guard fire this tick" could suppress a real alert. The count
+    must reflect exactly one unguarded task out of two ready.
+    """
+    with kb.connect() as conn:
+        guarded = kb.create_task(conn, title="pr", assignee="alice")
+        kb.add_comment(conn, guarded, "worker", "PR: https://github.com/o/r/pull/3")
+        kb.create_task(conn, title="stuck", assignee="bob")
+        total, unguarded = kb.count_unguarded_ready(conn)
+    assert total == 2
+    assert unguarded == 1
+
+
+def test_count_unguarded_ready_empty_queue(kanban_home):
+    with kb.connect() as conn:
+        assert kb.count_unguarded_ready(conn) == (0, 0)
+
+
+def test_count_unguarded_ready_ignores_terminal_lanes(kanban_home, monkeypatch):
+    """Matches has_spawnable_ready's scope — control-plane lanes never count,
+    guarded or not."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    with kb.connect() as conn:
+        kb.create_task(conn, title="terminal", assignee="orion-cc")
+        assert kb.count_unguarded_ready(conn) == (0, 0)
+
+
+def test_dispatcher_stuck_message_all_guarded_is_quiet_info():
+    """All ready work guarded -> info level, not a warning. Silence would
+    be almost as confusing as the false alarm it replaces, so this still
+    says something."""
+    outcome = kb.dispatcher_stuck_message(total_ready=3, unguarded_ready=0, bad_ticks=6)
+    assert outcome is not None
+    level, text = outcome
+    assert level == "info"
+    assert "3" in text
+
+
+def test_dispatcher_stuck_message_unguarded_warns():
+    outcome = kb.dispatcher_stuck_message(total_ready=1, unguarded_ready=1, bad_ticks=6)
+    assert outcome is not None
+    level, text = outcome
+    assert level == "warn"
+    assert "1" in text
+
+
+def test_dispatcher_stuck_message_mixed_warns_about_unguarded_count_only():
+    """Mixed guarded+unguarded still warns, and the count reported is the
+    unguarded portion (2), not the total (5) — the case a naive
+    'any guard fired -> suppress' fix would get wrong."""
+    outcome = kb.dispatcher_stuck_message(total_ready=5, unguarded_ready=2, bad_ticks=6)
+    assert outcome is not None
+    level, text = outcome
+    assert level == "warn"
+    assert "2" in text
+    assert "5" not in text
+
+
+def test_dispatcher_stuck_message_empty_queue_is_silent():
+    assert kb.dispatcher_stuck_message(total_ready=0, unguarded_ready=0, bad_ticks=6) is None
+
+
 def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable):
     spawns = []
 

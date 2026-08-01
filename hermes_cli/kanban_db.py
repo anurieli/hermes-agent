@@ -7860,6 +7860,92 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def count_unguarded_ready(conn: sqlite3.Connection) -> "tuple[int, int]":
+    """Return ``(total, unguarded)`` counts of ready+spawnable tasks.
+
+    ``total`` matches :func:`has_spawnable_ready`'s filter exactly: ready,
+    assigned, unclaimed, and mapped to a real Hermes profile. ``unguarded``
+    is the subset NOT currently deferred by :func:`check_respawn_guard`
+    (``active_pr``, ``blocker_auth``, ``rate_limit_cooldown``,
+    ``recent_success``).
+
+    Exists so the gateway- and CLI-embedded dispatchers' health telemetry
+    can tell a genuinely stuck dispatcher (spawnable, unguarded work sitting
+    untouched — broken profile, missing venv, PATH drift, dead credentials)
+    apart from one that is correctly idle because every ready task is
+    deliberately held back, most commonly by ``active_pr`` while a worker's
+    PR sits waiting on human review. A stuck-check that only asks "is the
+    ready queue non-empty and did nothing spawn" cannot tell these apart,
+    and false-alarms every time a worker empties its real queue and is
+    left holding PRs awaiting review (2026-08-01: 41,835 ``active_pr``
+    guard events logged over 9 days against zero real spawn failures).
+
+    Calls :func:`check_respawn_guard` directly so this can never drift
+    from the guard ``dispatch_once`` actually applies.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'ready' AND assignee IS NOT NULL "
+        "    AND claim_lock IS NULL"
+    ).fetchall()
+    if not rows:
+        return (0, 0)
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None
+    total = 0
+    unguarded = 0
+    for row in rows:
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        total += 1
+        if check_respawn_guard(conn, row["id"]) is None:
+            unguarded += 1
+    return (total, unguarded)
+
+
+def dispatcher_stuck_message(
+    total_ready: int, unguarded_ready: int, bad_ticks: int,
+) -> "Optional[tuple[str, str]]":
+    """Decide what the dispatcher stuck-check should say, if anything.
+
+    Pure function: takes counts and a tick streak, returns ``(level, text)``
+    or ``None``. Callers own their own bad-tick counters and repeat
+    rate-limiting; this only decides WHAT to say once a caller has already
+    decided the streak is long enough to speak up. Shared between the
+    gateway-embedded dispatcher and the deprecated standalone CLI daemon
+    so the two never drift back into disagreement.
+
+    * ``unguarded_ready > 0`` → ``"warn"``: real spawnable work exists and
+      nothing spawned it. The actionable "check profile health" case. The
+      count reported is the unguarded portion only, even when some ready
+      work is also guarded — a mix of both should still warn about the
+      genuinely stuck part.
+    * ``unguarded_ready == 0`` but ``total_ready > 0`` → ``"info"``: every
+      ready task is deliberately held back (most often ``active_pr``
+      awaiting human review, or a cooldown). Not stuck, but silence here
+      would be almost as confusing as the false alarm it replaces.
+    * ``total_ready == 0`` → ``None``: nothing ready, nothing to say.
+    """
+    if unguarded_ready > 0:
+        return ("warn", (
+            f"ready queue has {unguarded_ready} spawnable task(s) not held "
+            f"back by a guard, stuck for {bad_ticks} consecutive ticks, but "
+            f"0 workers spawned successfully. Check profile health (venv, "
+            f"PATH, credentials) and `hermes kanban list --status ready` / "
+            f"`hermes kanban list --status blocked` for recent spawn_failed "
+            f"tasks."
+        ))
+    if total_ready > 0:
+        return ("info", (
+            f"ready queue non-empty ({total_ready} task(s)), all "
+            f"respawn-guarded (pending PR review or a cooldown) — nothing "
+            f"to spawn right now."
+        ))
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,

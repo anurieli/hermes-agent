@@ -2397,28 +2397,35 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        total_ready, unguarded_ready = _spawnable_ready_counts()
+        # Fold in skipped_unassigned: a ready task with no assignee at all
+        # has no respawn guard to speak of and is always a genuine,
+        # actionable problem, so it counts toward both total and unguarded.
+        unassigned = len(res.skipped_unassigned)
+        total_ready += unassigned
+        unguarded_ready += unassigned
+        ready_pending = total_ready > 0
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
-        # Emit a warning once per HEALTH_WINDOW bad ticks (not every tick)
+        # Emit a message once per HEALTH_WINDOW bad ticks (not every tick)
         # so log volume stays bounded while the problem persists.
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
-            # Rate-limit repeats: at most one warning per 5 minutes.
+            # Rate-limit repeats: at most one message per 5 minutes.
             if now - health_state["last_warn_at"] >= 300:
-                print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
-                    f"ready queue non-empty for {health_state['bad_ticks']} "
-                    f"consecutive ticks but 0 workers spawned successfully. "
-                    f"Check profile health (venv, PATH, credentials) and "
-                    f"`hermes kanban list --status ready` / "
-                    f"`hermes kanban list --status blocked` for recent "
-                    f"spawn_failed tasks.",
-                    file=sys.stderr, flush=True,
+                outcome = kb.dispatcher_stuck_message(
+                    total_ready, unguarded_ready, health_state["bad_ticks"],
                 )
+                if outcome is not None:
+                    level, text = outcome
+                    label = "WARN dispatcher stuck" if level == "warn" else "INFO dispatcher idle"
+                    print(
+                        f"[{_fmt_ts(now)}] {label}: {text}",
+                        file=sys.stderr, flush=True,
+                    )
                 health_state["last_warn_at"] = now
         if not verbose:
             return
@@ -2436,10 +2443,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
-    def _ready_queue_nonempty() -> bool:
-        """Cheap probe — is there at least one ready+assigned+unclaimed
-        task whose assignee maps to a real Hermes profile (i.e. one the
-        dispatcher would actually try to spawn for)?
+    def _spawnable_ready_counts() -> "tuple[int, int]":
+        """Cheap probe — ``(total, unguarded)`` counts of ready+assigned+
+        unclaimed tasks whose assignee maps to a real Hermes profile (i.e.
+        ones the dispatcher would actually try to spawn for).
+
+        ``unguarded`` excludes tasks currently deferred by
+        ``check_respawn_guard`` (most commonly ``active_pr`` — a worker
+        already opened a PR and is correctly waiting on human review, not
+        stuck). See :func:`hermes_cli.kanban_db.count_unguarded_ready`.
 
         Filters out tasks assigned to control-plane lanes
         (e.g. ``orion-cc``, ``orion-research``) that are pulled by
@@ -2448,9 +2460,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         """
         try:
             with kb.connect_closing() as conn:
-                return kb.has_spawnable_ready(conn)
+                return kb.count_unguarded_ready(conn)
         except Exception:
-            return False
+            return (0, 0)
 
     try:
         kb.run_daemon(
