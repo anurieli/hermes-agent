@@ -275,6 +275,57 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
 
 
+def _harden_socket_client(client: Any) -> None:
+    """Stop slack_sdk's reconnect loop from outliving the client that owns it.
+
+    ``AsyncSocketModeClient.connect`` is an unbounded ``while True`` whose only
+    exit is a successful ``ws_connect``; it never consults ``self.closed``. So a
+    reconnect that is in flight when the client is closed keeps hammering the
+    now-closed aiohttp session every ``ping_interval`` seconds forever, logging
+    ``Failed to connect (error: Session is closed); Retrying...`` and nothing
+    else. The gateway process stays up and systemd reports it healthy while
+    Slack delivery is dead.
+
+    That is exactly how cody went deaf: last inbound Slack message 2026-08-03
+    08:27, ~1,500 retries at a 10 second cadence, zero adapter-level restarts,
+    43 hours before a human noticed. Outbound chat.postMessage kept working the
+    whole time, which is why his hourly alerts still arrived and made the
+    gateway look alive.
+
+    This wraps ``connect`` so the loop is supervised: once ``closed`` flips, the
+    retry task is cancelled and the caller gets a normal exception the adapter
+    watchdog can act on, instead of an invisible coroutine spinning forever.
+    """
+    original = getattr(client, "connect", None)
+    if original is None or getattr(original, "_hermes_closed_guard", False):
+        return
+
+    async def connect_with_closed_guard() -> None:
+        if getattr(client, "closed", False):
+            raise RuntimeError("Socket Mode client is closed; refusing to reconnect")
+
+        task = asyncio.ensure_future(original())
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=1.0)
+            if done:
+                return task.result()
+            if getattr(client, "closed", False):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise RuntimeError(
+                    "Socket Mode client closed mid-reconnect; loop aborted"
+                )
+
+    connect_with_closed_guard._hermes_closed_guard = True  # type: ignore[attr-defined]
+    try:
+        client.connect = connect_with_closed_guard  # type: ignore[assignment]
+    except Exception:  # pragma: no cover - optional client API
+        logger.debug("[Slack] Could not install Socket Mode connect guard", exc_info=True)
+
+
 def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
     """Apply a resolved proxy to a Slack SDK client or clear it explicitly."""
     if hasattr(client, "proxy"):
@@ -509,27 +560,26 @@ class SlackAdapter(BasePlatformAdapter):
             self._app, self._app_token, proxy=self._proxy_url
         )
         _apply_slack_proxy(self._handler.client, self._proxy_url)
+        _harden_socket_client(self._handler.client)
 
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         task.add_done_callback(self._on_socket_mode_task_done)
 
     async def _stop_socket_mode_handler(self) -> None:
-        """Stop Socket Mode handler and task."""
+        """Stop Socket Mode handler and task, leaving no reconnect loop behind.
+
+        Order matters. The previous version closed the handler first, which
+        closes the aiohttp session, and only then cancelled our task. Anything
+        already inside slack_sdk's ``connect()`` retry loop at that moment
+        survived the close and kept retrying against a session that could never
+        reopen. Cancelling first means the loop unwinds while its session is
+        still valid, so nothing is left holding a dead socket.
+        """
         handler = self._handler
         task = self._socket_mode_task
         self._handler = None
         self._socket_mode_task = None
-
-        if handler is not None:
-            try:
-                await handler.close_async()
-            except Exception as e:  # pragma: no cover - defensive logging
-                logger.warning(
-                    "[Slack] Error while closing Socket Mode handler: %s",
-                    e,
-                    exc_info=True,
-                )
 
         if task is not None and not task.done():
             task.cancel()
@@ -541,6 +591,42 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[Slack] Socket Mode task failed while stopping", exc_info=True
                 )
+
+        if handler is not None:
+            client = getattr(handler, "client", None)
+            if client is not None:
+                # Mark closed before close_async so the guard installed by
+                # _harden_socket_client aborts any in-flight reconnect instead
+                # of letting it outlive this handler.
+                try:
+                    client.closed = True
+                    client.auto_reconnect_enabled = False
+                except Exception:  # pragma: no cover - optional client API
+                    logger.debug(
+                        "[Slack] Could not mark Socket Mode client closed",
+                        exc_info=True,
+                    )
+
+            try:
+                await handler.close_async()
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "[Slack] Error while closing Socket Mode handler: %s",
+                    e,
+                    exc_info=True,
+                )
+
+            # close() cancels these, but only when it runs cleanly. If it raised
+            # part way through, an orphaned monitor or receiver can still call
+            # connect(). Cancel them unconditionally.
+            for attr in (
+                "current_session_monitor",
+                "message_receiver",
+                "message_processor",
+            ):
+                fut = getattr(client, attr, None)
+                if fut is not None and not fut.done():
+                    fut.cancel()
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""
