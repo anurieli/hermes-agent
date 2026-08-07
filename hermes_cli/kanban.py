@@ -652,6 +652,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+    p_archive.add_argument(
+        "--force",
+        action="store_true",
+        help="Archive an unfinished task despite the assignee's delivery "
+             "contract (a deliberate human discard, not a routine cleanup)",
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -2195,7 +2201,8 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            if not kb.archive_task(conn, tid,
+                                   force=bool(getattr(args, "force", False))):
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:

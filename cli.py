@@ -16239,6 +16239,24 @@ def main(
             sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
+            # Kanban workers are dispatcher-owned. A gateway or interactive
+            # agent launching this magic prompt directly bypasses the worker
+            # cgroup, concurrency controls, and run ownership bookkeeping.
+            # Fail closed unless _default_spawn supplied the launch marker.
+            _query_text = (query or "").strip()
+            # Prefix match, not fullmatch: the dispatcher may append a resume
+            # preamble after the task id. With fullmatch, any appended suffix
+            # would silently disable this guard for direct launches too.
+            if (
+                re.match(r"work\s+kanban\s+task\s+t_[A-Za-z0-9]+\b", _query_text)
+                and os.environ.get("HERMES_KANBAN_DISPATCHED") != "1"
+            ):
+                print(
+                    "Refusing direct kanban worker launch: file or unblock the task and let "
+                    "the dispatcher start its contained worker.",
+                    file=sys.stderr,
+                )
+                sys.exit(78)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
             # the actual task description lives in the task body. Mirror the
             # gateway/CLI behaviour for inbound images by scanning the body for

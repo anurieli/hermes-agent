@@ -2449,6 +2449,20 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    if max_runtime_seconds is None:
+        default_runtime = os.environ.get("HERMES_KANBAN_DEFAULT_MAX_RUNTIME_SECONDS", "").strip()
+        if default_runtime:
+            try:
+                max_runtime_seconds = max(1, int(default_runtime))
+            except ValueError as exc:
+                raise ValueError("HERMES_KANBAN_DEFAULT_MAX_RUNTIME_SECONDS must be an integer") from exc
+    if max_retries is None:
+        default_retries = os.environ.get("HERMES_KANBAN_DEFAULT_MAX_RETRIES", "").strip()
+        if default_retries:
+            try:
+                max_retries = max(0, int(default_retries))
+            except ValueError as exc:
+                raise ValueError("HERMES_KANBAN_DEFAULT_MAX_RETRIES must be an integer") from exc
     if deployment_target is not None:
         deployment_target = str(deployment_target).strip() or None
     if not title or not title.strip():
@@ -4160,6 +4174,122 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# ---------------------------------------------------------------------------
+# Delivery contract (per-assignee policy gates)
+#
+# An assignee profile can declare, in its own config.yaml:
+#
+#     kanban:
+#       delivery_contract:
+#         enabled: true
+#         # optional: override the block-reason denylist
+#         # work_block_patterns: ["...regex...", ...]
+#
+# When enabled, three verbs acquire hard preconditions AT THIS LAYER — the only
+# chokepoint every caller shares (agent tools call kanban_db in-process, the CLI
+# and the dashboard land here too):
+#
+#   * complete_task refuses a completion whose result/summary carries no
+#     handoff: no PR URL, no already-delivered evidence citing a commit, and no
+#     explicit cancellation. "The code is written" is not a finish.
+#   * block_task refuses a block whose reason describes the worker's own work
+#     (a stale base branch, its own review findings) rather than a decision a
+#     human owns.
+#   * archive_task refuses to archive a task that never completed, unless
+#     forced. Archiving is the quietest way for work to die.
+#
+# Why this exists: these three rules already lived in the assignee's prompt and
+# were violated anyway (completions with unpushed branches, blocks on "needs
+# rebase", five tasks bulk-archived to dodge a question). Prose binds a model
+# only while it is present and reading; a precondition binds every caller,
+# every time. The refusal messages are written to be read BY the worker model
+# mid-task: each one states exactly what to do instead.
+#
+# Escape hatch: HERMES_KANBAN_CONTRACT_OVERRIDE=1 disables all three gates for
+# that invocation (plus --force on the archive CLI). This is same-user code, so
+# the gates are affordance removal, not a security boundary; a deliberate
+# override is visible in shell history and events, and the out-of-process
+# watchdog still witnesses the outcome.
+# ---------------------------------------------------------------------------
+
+CONTRACT_OVERRIDE_ENV = "HERMES_KANBAN_CONTRACT_OVERRIDE"
+
+_CONTRACT_PR_URL_RE = re.compile(r"https?://[\w.-]+/[\w./-]+/pull(?:s)?/\d+")
+_CONTRACT_COMMIT_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+_CONTRACT_ALREADY_RE = re.compile(
+    r"\balready[\s-](?:done|delivered|implemented|merged|shipped|landed|on\b|present|exists)",
+    re.IGNORECASE,
+)
+_CONTRACT_CANCEL_RE = re.compile(r"\bcancell?ed\b", re.IGNORECASE)
+
+# Block reasons that describe the worker's own work. Deliberately narrow: only
+# shapes that have actually recurred, so a genuine question is never refused.
+_CONTRACT_WORK_BLOCK_PATTERNS = (
+    r"behind\s+origin/",
+    r"\bneeds?\s+(?:a\s+)?rebase\b",
+    r"\brebase\s+or\s+reapply\b",
+    r"\breview-required\b",
+    r"\b(?:self|independent|own)[\s-]review\s+found\b",
+    r"\bmy\s+own\s+review\b",
+)
+
+
+def _task_assignee(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return row["assignee"] if row else None
+
+
+def _delivery_contract(assignee: Optional[str]) -> Optional[dict]:
+    """The assignee profile's delivery-contract config, or None when inactive.
+
+    Keyed on the TASK'S assignee, not the invoking process: the point is that
+    the contract travels with the profile (packageable), and that re-invoking
+    the CLI under a different HERMES_HOME does not shed it. Reads the profile
+    config via the context-local home override (same pattern as
+    ``_resolve_worker_cli_toolsets``); never mutates ``os.environ``.
+    """
+    if not assignee:
+        return None
+    if os.environ.get(CONTRACT_OVERRIDE_ENV) == "1":
+        return None
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        home = resolve_profile_env(assignee)
+    except Exception:
+        return None  # assignee is not a profile: no contract to apply
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    token = set_hermes_home_override(home)
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        contract = cfg_get(
+            load_config_readonly(), "kanban", "delivery_contract", default=None
+        )
+    except Exception:
+        return None
+    finally:
+        reset_hermes_home_override(token)
+    if not isinstance(contract, dict) or not contract.get("enabled"):
+        return None
+    return contract
+
+
+def _contract_completion_ok(text: str) -> bool:
+    """True when completion text carries a legal handoff: a PR URL, an
+    already-delivered claim citing a commit hash, or an explicit cancel."""
+    if _CONTRACT_PR_URL_RE.search(text):
+        return True
+    if _CONTRACT_ALREADY_RE.search(text) and _CONTRACT_COMMIT_RE.search(text):
+        return True
+    if _CONTRACT_CANCEL_RE.search(text):
+        return True
+    return False
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4199,6 +4329,38 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # Gate: the delivery contract, when the assignee's profile declares one.
+    # Same shape as the phantom-card gate below: auditable event in a tiny
+    # txn, then raise, with no task-state mutation. The error text is written
+    # for the WORKER to read and act on mid-task — the refusal arrives at the
+    # exact moment the model believes it is finished, which is the one moment
+    # an instruction about finishing actually lands.
+    if _delivery_contract(_task_assignee(conn, task_id)) is not None:
+        completion_text = "\n".join(t for t in (summary, result) if t)
+        if not _contract_completion_ok(completion_text):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_contract",
+                    {
+                        "summary_preview": (
+                            completion_text.strip().splitlines()[0][:200]
+                            if completion_text.strip() else None
+                        ),
+                    },
+                )
+            raise ValueError(
+                f"delivery contract: refusing to complete {task_id} — the "
+                "completion carries no handoff. A finish is one of exactly "
+                "three things, and the summary/result must show it: "
+                "(1) the pull request URL (push the branch and open the PR "
+                "FIRST, then complete with the URL); "
+                "(2) evidence the work was already delivered, naming the "
+                "specific commit hash; "
+                "(3) an explicit cancellation. "
+                "Passing checks and a clean review are not a finish if "
+                "nothing reached the remote."
+            )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4999,6 +5161,40 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
+    # Gate: the delivery contract. A block is a claim that a HUMAN owes this
+    # task something. When the reason describes the worker's own work (a stale
+    # base branch, findings from its own review), that claim is false, and
+    # accepting it strands the task on a person who was never actually asked
+    # anything. Refused here, at the layer every caller shares.
+    contract = _delivery_contract(_task_assignee(conn, task_id))
+    if contract is not None:
+        block_text = (reason or "").strip()
+        if not block_text:
+            raise ValueError(
+                f"delivery contract: refusing to block {task_id} without a "
+                "reason. A block must state the decision or credential a "
+                "human owes; if there is none, keep working."
+            )
+        patterns = (
+            contract.get("work_block_patterns")
+            or _CONTRACT_WORK_BLOCK_PATTERNS
+        )
+        for pattern in patterns:
+            try:
+                matched = re.search(pattern, block_text, re.IGNORECASE)
+            except re.error:
+                continue
+            if matched:
+                raise ValueError(
+                    f"delivery contract: refusing to block {task_id} — the "
+                    f"reason describes work, not a decision "
+                    f"(matched {matched.group(0)!r}). A stale branch gets "
+                    "rebased; findings from your own review get fixed. Do "
+                    "the work, re-run the checks, and open the PR. Block "
+                    "only for a decision or credential a human actually owns."
+                )
+
     normalized_choices: list[str] = []
     seen_choices: set[str] = set()
     for raw_choice in choices or ():
@@ -5770,7 +5966,28 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, force: bool = False
+) -> bool:
+    # Gate: the delivery contract. Archiving a task that never completed is
+    # silent cancellation — the quietest way for work to die, and the exact
+    # move behind the 2026-08-03 incident where five tasks were bulk-archived
+    # to dodge one question. When the assignee's profile declares a contract,
+    # an unfinished task can only be archived by someone saying so explicitly
+    # (``force=True`` / ``--force`` on the CLI / the override env var).
+    if not force and _delivery_contract(_task_assignee(conn, task_id)) is not None:
+        status_row = conn.execute(
+            "SELECT status, completed_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if status_row and status_row["status"] not in ("done", "archived") \
+                and not status_row["completed_at"]:
+            raise ValueError(
+                f"delivery contract: refusing to archive {task_id} — it never "
+                "completed. Finish it (PR, already-done evidence, or explicit "
+                "cancel) or leave it on the board where it can be seen. A "
+                "human discarding it on purpose can pass --force."
+            )
+
     with write_txn(conn):
         prev_worker_row = conn.execute(
             "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
@@ -8707,6 +8924,31 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
+    # Resume stance. A fresh worker on a task with prior closed runs is a NEW
+    # model instance with no memory of the previous one, and its default is to
+    # treat the earlier attempt's work as suspect input: re-plan, re-audit,
+    # re-review. That instinct is how a resumed task re-litigates itself
+    # instead of finishing (observed repeatedly on this board, worst on
+    # 2026-08-03 when a resumed instance paused an entire repo's queue for an
+    # "audit" nobody asked for). The full history already reaches the worker
+    # via kanban_show's worker_context; this preamble sets how to READ it:
+    # as its own past, to be trusted and continued.
+    try:
+        with connect_closing(board=board) as _resume_conn:
+            prior_runs = list_runs(
+                _resume_conn, task.id, include_active=False
+            )
+    except Exception:
+        prior_runs = []
+    if prior_runs:
+        prompt += (
+            f" -- RESUME, attempt {len(prior_runs) + 1}: {len(prior_runs)} "
+            "prior run(s) ended before completing. The worktree and the task "
+            "comments carry that progress; it is YOUR OWN past work, not a "
+            "stranger's. Read kanban_show worker_context first, trust it, and "
+            "continue from where it stopped. Do not re-plan, re-audit, or "
+            "restart the implementation."
+        )
     env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
@@ -8788,6 +9030,10 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # Only the dispatcher may create a kanban worker. Gateway agents must file
+    # tasks and return; they may not impersonate the dispatcher by launching
+    # `work kanban task ...` from a chat turn.
+    env["HERMES_KANBAN_DISPATCHED"] = "1"
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -8832,6 +9078,36 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+
+    # On Linux, place each worker and every descendant it creates in a
+    # dedicated transient service. A scope cannot move a process out of an
+    # existing systemd service cgroup, which is exactly where the dispatcher
+    # runs. The transient service gives the worker a real sibling cgroup.
+    use_systemd_service = (
+        os.name == "posix"
+        and sys.platform.startswith("linux")
+        and os.environ.get("HERMES_KANBAN_TASK_SCOPES", "").lower()
+        in {"1", "true", "yes", "on"}
+    )
+    systemd_run = None
+    systemd_unit = None
+    systemd_properties: dict[str, str] = {}
+    if use_systemd_service:
+        import shutil
+
+        systemd_run = shutil.which("systemd-run")
+        if not systemd_run:
+            raise RuntimeError("HERMES_KANBAN_TASK_SCOPES is enabled but systemd-run is unavailable")
+        safe_task_id = re.sub(r"[^A-Za-z0-9_.-]", "-", task.id)[:80]
+        run_suffix = str(task.current_run_id or int(time.time()))
+        systemd_unit = f"hermes-task-{safe_task_id}-{run_suffix}"
+        systemd_properties = {
+            "MemoryHigh": os.environ.get("HERMES_KANBAN_MEMORY_HIGH", "1536M"),
+            "MemoryMax": os.environ.get("HERMES_KANBAN_MEMORY_MAX", "2G"),
+            "MemorySwapMax": os.environ.get("HERMES_KANBAN_MEMORY_SWAP_MAX", "256M"),
+            "TasksMax": os.environ.get("HERMES_KANBAN_TASKS_MAX", "256"),
+            "CPUQuota": os.environ.get("HERMES_KANBAN_CPU_QUOTA", "200%"),
+        }
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -8841,6 +9117,65 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+
+    if use_systemd_service:
+        assert systemd_run and systemd_unit
+        service_cmd = [
+            systemd_run,
+            "--user",
+            "--collect",
+            "--quiet",
+            "--service-type=exec",
+            f"--unit={systemd_unit}",
+            "--property", "KillMode=control-group",
+            "--property", f"StandardOutput=append:{log_path}",
+            "--property", f"StandardError=append:{log_path}",
+        ]
+        worker_env_names = {
+            "PATH", "VIRTUAL_ENV", "LANG", "LC_ALL",
+            "HERMES_HOME", "HERMES_TENANT", "HERMES_PROFILE",
+            "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE",
+            "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_GOAL_MODE",
+            "HERMES_KANBAN_GOAL_MAX_TURNS", "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_DISPATCHED", "TERMINAL_CWD",
+            "TERMINAL_TIMEOUT", "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+        }
+        for name in sorted(worker_env_names):
+            if name in env:
+                service_cmd.append(f"--setenv={name}={env[name]}")
+        for key, value in systemd_properties.items():
+            service_cmd.extend(["--property", f"{key}={value}"])
+        service_cmd.extend(["--", *cmd])
+        launched = subprocess.run(
+            service_cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if launched.returncode != 0:
+            detail = (launched.stderr or launched.stdout or "").strip()
+            raise RuntimeError(f"failed to launch contained worker: {detail[:300]}")
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", f"{systemd_unit}.service", "-p", "MainPID", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        try:
+            main_pid = int(shown.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"contained worker has no MainPID: {shown.stderr.strip()}") from exc
+        if main_pid <= 0:
+            raise RuntimeError("contained worker exited before its MainPID was recorded")
+        return main_pid
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
