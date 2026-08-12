@@ -185,7 +185,7 @@ describe('createSlashHandler', () => {
     })
   })
 
-  it('keeps typed /model switches session-scoped by default', async () => {
+  it('routes typed /model switches without forcing temporary scope', async () => {
     patchUiState({ sid: 'sid-abc' })
 
     const ctx = buildCtx({

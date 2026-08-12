@@ -217,7 +217,7 @@ Switch between already-configured models without leaving a session:
 /model openrouter:anthropic/claude-sonnet-4  # Switch back to cloud
 ```
 
-By default, `/model` changes apply **to the current session only**. Add `--global` to persist the change to `config.yaml` (or set `model.persist_switch_by_default: true` to make every switch persist):
+By default, `/model` changes persist to `config.yaml` and survive `/new`. Use `--session` for the current conversation only or `--once` for one turn. `--global` remains accepted as an explicit persistence alias:
 
 ```
 /model claude-sonnet-4 --global     # Switch and save as new default

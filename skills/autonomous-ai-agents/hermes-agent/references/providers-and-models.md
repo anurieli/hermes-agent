@@ -56,7 +56,7 @@ model:
     fav: openrouter/anthropic/claude-sonnet-4.6
 ```
 
-`/model fav` — session-scoped; add `--global` to persist as default.
+`/model fav` persists as the default; add `--session` for this conversation only.
 
 Built-in aliases (catalog-resolved against the active provider): `sonnet`,
 `opus`, `haiku`, `claude`, `gpt5`, `gpt`, `codex`, `o3`, `o4`, `gemini`,

@@ -16,11 +16,11 @@ Sometimes Hermes seems less sharp than it was yesterday, or forgets something yo
 
 **What it means:** A model switch is a capability change, and it's easy to end up on a different model than you think:
 
-- A plain `/model <name>` switch is **session-only** by default (unless `model.persist_switch_by_default: true` is set), so the model you're on may not match what's in `config.yaml`.
+- A plain `/model <name>` switch persists to `config.yaml` and survives `/new`; `--session` and `--once` are the explicit temporary modes.
 - Changing the main model from the dashboard's Models page applies to **new sessions only** — an already-open chat keeps running whatever model it started with.
 - If you switched to a faster model for a simple task (a pattern [Tips & Best Practices](/guides/tips#choose-the-right-model) recommends), remember to switch back for complex reasoning work.
 
-If the model is wrong, `/model <name>` fixes it for this session; add `--global` to persist the change to `config.yaml`. Note that a mid-session switch resets the prompt cache, so the next turn re-reads the conversation at full input price — on a long session it can be cheaper to start fresh on the right model.
+If the model is wrong, `/model <name>` fixes it now and saves it as the default. Add `--session` when you do not want to change the default. Note that a mid-session switch resets the prompt cache, so the next turn re-reads the conversation at full input price — on a long session it can be cheaper to start fresh on the right model.
 
 ## 2. Check context usage
 

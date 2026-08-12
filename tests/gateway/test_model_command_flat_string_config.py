@@ -106,6 +106,40 @@ async def test_model_global_persists_when_config_has_flat_string_model(tmp_path,
 
 
 @pytest.mark.asyncio
+async def test_plain_model_switch_persists_for_new_sessions(tmp_path, monkeypatch):
+    """A normal Telegram /model choice updates config without --global."""
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "gpt-5.6-terra", "provider": "openai-codex"},
+    )
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5")
+    )
+
+    assert result is not None
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "gpt-5.5"
+    assert written["model"]["provider"] == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_session_flag_keeps_model_switch_temporary(tmp_path, monkeypatch):
+    """Telegram users can still opt into a conversation-only model choice."""
+    original_model = {"default": "gpt-5.6-terra", "provider": "openai-codex"}
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, original_model)
+
+    result = await _make_runner()._handle_model_command(
+        _make_event("/model gpt-5.5 --session")
+    )
+
+    assert result is not None
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"] == original_model
+
+
+@pytest.mark.asyncio
 async def test_model_global_persists_when_config_has_missing_model(tmp_path, monkeypatch):
     """Companion case: ``model:`` key absent entirely. setdefault would have
     worked here, but the coercion branch also has to handle this cleanly.

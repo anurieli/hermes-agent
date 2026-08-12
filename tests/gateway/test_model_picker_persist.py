@@ -9,9 +9,8 @@ model in the Telegram/Discord picker silently reverted on the next launch while
 
 After the fix (#49176), the picker callback honors the resolved
 ``persist_global`` and runs the same read-modify-write block the text path
-uses, so a tapped model behaves exactly like a typed one.  Since the
-session-scope-by-default change, both default to session-only and persist
-only with ``--global`` (or ``model.persist_switch_by_default: true``).
+uses, so a tapped model behaves exactly like a typed one. Both persist by
+default; ``--session`` or ``--once`` is required for temporary behavior.
 
 These tests drive the real ``_handle_model_command`` with a fake picker-capable
 adapter that captures the ``on_model_selected`` callback, then invoke that

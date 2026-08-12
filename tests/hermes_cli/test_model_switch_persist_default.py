@@ -1,12 +1,11 @@
-"""Tests for session-scoped-by-default model switching.
+"""Tests for persist-by-default model switching.
 
 Covers:
 - ``parse_model_flags`` recognises ``--session`` (and keeps ``--global``).
 - ``resolve_persist_behavior`` applies the config-gated default and the
   ``--session`` / ``--global`` overrides.
-- The default (no flags) is session-only, which is the user-facing fix: a
-  plain ``/model <name>`` affects only the current session unless the user
-  passes ``--global`` or sets ``model.persist_switch_by_default: true``.
+- The default (no flags) persists, so a plain ``/model <name>`` survives
+  ``/new``. Temporary switches require ``--session`` or ``--once``.
 """
 
 from unittest.mock import patch
@@ -41,6 +40,14 @@ class TestParseModelFlagsSession:
 
 
 class TestResolvePersistBehavior:
+    def test_no_flags_persist_when_config_missing(self):
+        with _config({}):
+            assert resolve_persist_behavior(False, False) is True
+
+    def test_no_flags_persist_when_model_config_is_flat(self):
+        with _config({"model": "gpt-5.6-terra"}):
+            assert resolve_persist_behavior(False, False) is True
+
     def test_session_flag_always_session_only(self):
         # --session opts out even if the config default is True.
         with _config({"model": {"persist_switch_by_default": True}}):
@@ -51,6 +58,19 @@ class TestResolvePersistBehavior:
         # No --provider → respects config default (True).
         with _config({"model": {"persist_switch_by_default": True}}):
             assert resolve_persist_behavior(False, False, explicit_provider="") is True
+
+    def test_provider_switch_persists_without_temporary_flag(self):
+        with _config({}):
+            assert (
+                resolve_persist_behavior(
+                    False, False, explicit_provider="openai-codex"
+                )
+                is True
+            )
+
+    def test_once_flag_is_temporary(self):
+        with _config({}):
+            assert resolve_persist_behavior(False, False, is_once=True) is False
 
 
 # ---------------------------------------------------------------------------

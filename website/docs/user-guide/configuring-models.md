@@ -226,12 +226,12 @@ On OpenRouter (or any aggregator), bare model names resolve *within* the aggrega
 Inside any `hermes chat` session:
 
 ```
-/model gpt-5.4 --provider openrouter             # session-only
-/model gpt-5.4 --provider openrouter --global    # also persists to config.yaml
+/model gpt-5.4 --provider openrouter             # persists and survives /new
+/model gpt-5.4 --provider openrouter --session   # this conversation only
 /model claude-opus-4.6 --once                    # next turn only, then auto-restores
 ```
 
-`--global` does the same thing the dashboard's **Change** button does, plus it switches the running session in-place.
+A plain switch does the same thing the dashboard's **Change** button does, plus it switches the running session in-place. `--global` remains accepted as an explicit persistence alias.
 
 `--once` switches for a single turn and restores the previous model afterward — on success, error, or interrupt alike. Nothing is persisted: a gateway restart mid-turn comes back on the original model. Useful for escalating one hard question to an expensive model ("ask Opus just this once") or dropping to a cheap model for a throwaway query.
 

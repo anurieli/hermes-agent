@@ -35,7 +35,7 @@ it. New commands land often; `/help` in-session is always authoritative.
 ### Configuration
 ```
 /config                  Show config (CLI)
-/model [name] [--global] Switch model (session-scoped by default)
+/model [name] [--session|--once] Switch model (persists by default)
 /personality [name]      Set a personality
 /reasoning [level|show|hide] Reasoning effort/display (none..xhigh|max|ultra)
 /fast [normal|fast]      Priority/fast processing tier

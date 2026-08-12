@@ -9474,16 +9474,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Supports:
           /model                              — show current model + usage hints
-          /model <name>                       — switch model (this session only)
+          /model <name>                       — switch model and save as default
           /model <name> --once                — switch for the next turn only
           /model <name> --session             — switch for this session only (explicit)
-          /model <name> --global              — switch and persist to config.yaml
+          /model <name> --global              — switch and persist (explicit alias)
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
 
-        Persistence defaults to off (``model.persist_switch_by_default`` in
-        config.yaml, default False — switches are session-scoped). Use
-        ``--global`` to persist, or ``--once`` for the next turn only.
+        Persistence defaults to on (``model.persist_switch_by_default`` in
+        config.yaml, default True). Use ``--session`` for this conversation or
+        ``--once`` for the next turn only.
         """
         from hermes_cli.model_switch import (
             switch_model,
@@ -9509,10 +9509,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
             return
-        # Resolve the effective persistence once: --global forces persist,
-        # --session/--once force session-scope, otherwise defer to
-        # model.persist_switch_by_default (defaults to False so /model is
-        # session-scoped unless the user opts in).
+        # Resolve the effective persistence once: --session/--once force
+        # temporary scope, --global explicitly persists, and an unflagged
+        # switch persists by default so it survives /new.
         persist_global = resolve_persist_behavior(
             is_global_flag, is_session, is_once=one_turn,
             explicit_provider=explicit_provider,
@@ -15460,8 +15459,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # --- /model picker modal ---
             if self._model_picker_state:
                 try:
-                    # Picker selections follow the same session-scoped default
-                    # as /model <name>; honour model.persist_switch_by_default.
+                    # Picker selections follow the same persistent default as
+                    # /model <name>; honour model.persist_switch_by_default.
                     from hermes_cli.model_switch import resolve_persist_behavior
 
                     self._handle_model_picker_selection(

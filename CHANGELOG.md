@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-12
+
+- Changed `/model` semantics so an unflagged model or provider selection persists as the default across `/new` and gateway restarts. Temporary experimentation is now explicit: `--session` scopes it to the current conversation and `--once` scopes it to the next turn. The Telegram/Discord picker follows the same persistent-by-default rule. Added CLI and gateway regression coverage, including flat-string and missing model-config cases.
+
 ## 2026-08-10
 
 - Merged upstream `NousResearch/hermes-agent` v0.20.0 into the fork, closing a gap that had been open since the 2026-07-17 merge base: 5,532 upstream commits, 0.18.2 → 0.20.0. The fork's nine engine commits (~5,400 lines) all survive. 31 files conflicted across 42 hunks. Two fork fixes were **dropped as superseded**: the multimodal `re.sub` crash guard in `agent_runtime_helpers.py` (upstream's coercion also handles dict content and drops thinking/reasoning blocks) and `_harden_socket_client`, the Slack Socket Mode zombie-reconnect guard that came out of Cody's 43-hour silence. Upstream fixed that same bug independently against the same root cause (slack-sdk#1913) by cancelling every task that can reach `connect()` before `close_async`, which also covers the task-rebinding race the fork's guard did not. Both fork implementations and the call site were removed rather than kept alongside.

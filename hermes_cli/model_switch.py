@@ -590,19 +590,14 @@ def resolve_persist_behavior(
     1. ``--once`` explicitly opts out → ``False`` (next turn only).
     2. ``--session`` explicitly opts out → ``False`` (this session only).
     3. ``--global`` explicitly opts in → ``True``.
-    4. ``--provider`` given without an explicit persist flag → ``False``
-       (session only).  Provider switches are typically exploratory — the
-       user is trying a different backend for this conversation, not
-       reconfiguring the default.  ``--global`` can still force persist.
-    5. Otherwise defer to ``model.persist_switch_by_default`` in
-       ``config.yaml`` (defaults to ``False``: a plain ``/model <name>``
-       affects only the current session).  Users who want the old
-       persist-by-default behavior can set the key to ``true``; a one-off
-       ``--global`` always persists.
+    4. Otherwise defer to ``model.persist_switch_by_default`` in
+       ``config.yaml`` (defaults to ``True``: a plain ``/model <name>``
+       survives ``/new``). Users can retain the former session-scoped default
+       by explicitly setting this compatibility key to ``false``.
 
     The config read is defensive: on a fresh install ``model`` may be a
     flat string rather than a dict, in which case the built-in default
-    (``False``) applies.
+    (``True``) applies.
     """
     if is_once:
         return False
@@ -610,17 +605,15 @@ def resolve_persist_behavior(
         return False
     if is_global:
         return True
-    if explicit_provider:
-        return False
     try:
         from hermes_cli.config import load_config
 
         model_cfg = load_config().get("model")
         if isinstance(model_cfg, dict):
-            return bool(model_cfg.get("persist_switch_by_default", False))
+            return bool(model_cfg.get("persist_switch_by_default", True))
     except Exception:
         pass
-    return False
+    return True
 
 
 # ---------------------------------------------------------------------------
