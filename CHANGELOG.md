@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-08-19
+
+- Split the Slack lifecycle reactions into three independently controllable stages. `on_processing_start` / `on_processing_complete` previously hard-coded 👀 → ✅ (or ❌), and the only switch was `SLACK_REACTIONS=false`, which kills all three at once. Added `_reaction_name(stage)` reading `SLACK_REACTION_PROGRESS` / `SLACK_REACTION_SUCCESS` / `SLACK_REACTION_FAILURE`, each defaulting to the previous emoji and accepting `off`/`false`/`none`/empty to disable just that stage (or any emoji name to substitute it). `on_processing_complete` now also removes whatever the configured progress emoji is rather than assuming `eyes`. The matching `slack.reaction_progress` / `reaction_success` / `reaction_failure` config keys are bridged to those env vars alongside the existing `slack.reactions`. Behaviour is unchanged for every profile that sets none of them.
+- Motivation: Cody was stamping a ✅ on Ariel's own Slack messages every time a turn completed, in his build channels. A check mark from a bot reads as a verdict that the thing is handled, and that call is Ariel's ("Only I can give a check mark"). Cody now sets `SLACK_REACTION_SUCCESS=off` and keeps 👀 (seen, working) and ❌ (that turn failed), neither of which claims a judgement.
+
 ## 2026-08-12
 
 - Changed `/model` semantics so an unflagged model or provider selection persists as the default across `/new` and gateway restarts. Temporary experimentation is now explicit: `--session` scopes it to the current conversation and `--once` scopes it to the next turn. The Telegram/Discord picker follows the same persistent-by-default rule. Added CLI and gateway regression coverage, including flat-string and missing model-config cases.

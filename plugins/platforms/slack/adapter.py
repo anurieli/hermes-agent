@@ -3754,6 +3754,32 @@ class SlackAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("SLACK_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    # Per-stage lifecycle reaction names. ``SLACK_REACTIONS=false`` still kills
+    # all three at once; these give each stage its own switch so a profile can
+    # keep one and drop another. Set a stage to off/false/none/no/"" to disable
+    # just that stage, or to any emoji name to substitute it.
+    #
+    # Cody sets SLACK_REACTION_SUCCESS=off (2026-08-19): a ✅ from a bot on
+    # Ariel's own message reads as "this is handled", which is a judgement only
+    # he makes. He keeps 👀 (Cody saw it) and ❌ (the turn actually failed).
+    _REACTION_STAGE_DEFAULTS = {
+        "PROGRESS": "eyes",
+        "SUCCESS": "white_check_mark",
+        "FAILURE": "x",
+    }
+    _REACTION_DISABLED_VALUES = {"", "off", "false", "0", "no", "none"}
+
+    def _reaction_name(self, stage: str) -> str:
+        """Resolve the emoji for one lifecycle stage. Empty string = disabled."""
+        default = self._REACTION_STAGE_DEFAULTS[stage]
+        raw = os.getenv(f"SLACK_REACTION_{stage}")
+        if raw is None:
+            return default
+        name = raw.strip().lstrip(":").rstrip(":")
+        if name.lower() in self._REACTION_DISABLED_VALUES:
+            return ""
+        return name
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         if not self._reactions_enabled():
@@ -3764,8 +3790,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not ts or marker not in self._reacting_message_ids:
             return
         channel_id = getattr(event.source, "chat_id", None)
-        if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes", team_id)
+        progress = self._reaction_name("PROGRESS")
+        if channel_id and progress:
+            await self._add_reaction(channel_id, ts, progress, team_id)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -3782,11 +3809,16 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes", team_id)
+        progress = self._reaction_name("PROGRESS")
+        if progress:
+            await self._remove_reaction(channel_id, ts, progress, team_id)
+        final = ""
         if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
+            final = self._reaction_name("SUCCESS")
         elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(channel_id, ts, "x", team_id)
+            final = self._reaction_name("FAILURE")
+        if final:
+            await self._add_reaction(channel_id, ts, final, team_id)
 
     # ----- User identity resolution -----
 
@@ -9027,6 +9059,13 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_REQUIRE_MENTION_CHANNELS"] = str(rmc)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
+    # Per-stage lifecycle reaction overrides (progress / success / failure).
+    # `reaction_success: off` drops just the ✅ and keeps 👀 and ❌.
+    for _stage in ("progress", "success", "failure"):
+        _key = f"reaction_{_stage}"
+        _env = f"SLACK_REACTION_{_stage.upper()}"
+        if _key in slack_cfg and not os.getenv(_env):
+            os.environ[_env] = str(slack_cfg[_key]).lower()
     rt = slack_cfg.get("reaction_triggers")
     if rt is not None and not os.getenv("SLACK_REACTION_TRIGGERS"):
         if isinstance(rt, (list, tuple, set)):
