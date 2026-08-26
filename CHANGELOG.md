@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-08-26
+
+- Added the source-agnostic `meeting_reports` plugin kit: canonical JSON plus self-contained 24-hour HTML reports, one compact report-ready card, silent internal stage routing, idempotent Accept/Reject review states, Slack modal notes, Telegram ForceReply notes, TTL cleanup, operator CLI commands, and a Penny migration guide. Review actions record a verdict only and never dispatch proposed delegations.
+- Extended plugin platform hooks with Slack modal submission handlers and authorized Telegram text interceptors, and added native meeting-report card payloads to both adapters. Exposed the kanban notifier's terminal event allowlist so meeting pipeline events can verify that they remain outside user-facing task notifications.
+
 ## 2026-08-19
 
 - Split the Slack lifecycle reactions into three independently controllable stages. `on_processing_start` / `on_processing_complete` previously hard-coded 👀 → ✅ (or ❌), and the only switch was `SLACK_REACTIONS=false`, which kills all three at once. Added `_reaction_name(stage)` reading `SLACK_REACTION_PROGRESS` / `SLACK_REACTION_SUCCESS` / `SLACK_REACTION_FAILURE`, each defaulting to the previous emoji and accepting `off`/`false`/`none`/empty to disable just that stage (or any emoji name to substitute it). `on_processing_complete` now also removes whatever the configured progress emoji is rather than assuming `eyes`. The matching `slack.reaction_progress` / `reaction_success` / `reaction_failure` config keys are bridged to those env vars alongside the existing `slack.reactions`. Behaviour is unchanged for every profile that sets none of them.

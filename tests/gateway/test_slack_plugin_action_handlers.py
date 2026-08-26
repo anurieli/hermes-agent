@@ -140,6 +140,8 @@ def _connect_with_recording_app(
     adapter: SlackAdapter,
     *,
     plugin_handlers: list,
+    plugin_view_handlers: list | None = None,
+    registered_views: list | None = None,
 ) -> tuple[bool, list]:
     """Run adapter.connect() with mocks and return (result, registered_actions).
 
@@ -148,11 +150,19 @@ def _connect_with_recording_app(
     wired up.
     """
     registered_actions: list = []  # list of (action_id, callback)
+    view_sink = registered_views if registered_views is not None else []
 
     def mock_action(action_id):
         def decorator(fn):
             registered_actions.append((action_id, fn))
             return fn
+        return decorator
+
+    def mock_view(callback_id):
+        def decorator(fn):
+            view_sink.append((callback_id, fn))
+            return fn
+
         return decorator
 
     def mock_event(_event_type):
@@ -169,6 +179,7 @@ def _connect_with_recording_app(
     mock_app.event = mock_event
     mock_app.command = mock_command
     mock_app.action = mock_action
+    mock_app.view = mock_view
     mock_app.client = AsyncMock()
 
     mock_web_client = AsyncMock()
@@ -181,6 +192,7 @@ def _connect_with_recording_app(
 
     fake_mgr = MagicMock()
     fake_mgr.get_slack_action_handlers.return_value = plugin_handlers
+    fake_mgr.get_slack_view_handlers.return_value = plugin_view_handlers or []
 
     with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
          patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
@@ -211,6 +223,64 @@ class TestSlackAdapterPluginActionWiring:
         # Built-ins still wired
         action_ids = [aid for aid, _cb in registered]
         assert "hermes_approve_once" in action_ids
+
+    def test_plugin_action_wrapper_rejects_unauthorized_user(self):
+        callback = AsyncMock()
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        adapter._is_interactive_user_authorized = MagicMock(return_value=False)
+        result, registered = _connect_with_recording_app(
+            adapter,
+            plugin_handlers=[("meeting_action", callback, "meeting_reports")],
+        )
+        assert result is True
+        wrapped = dict(registered)["meeting_action"]
+        ack = AsyncMock()
+        asyncio.run(
+            wrapped(
+                ack,
+                {"user": {"id": "U_BAD"}, "channel": {"id": "C1"}},
+                {"action_id": "meeting_action"},
+                AsyncMock(),
+            )
+        )
+        ack.assert_awaited_once()
+        callback.assert_not_awaited()
+
+    def test_plugin_action_wrapper_preserves_authorized_callback(self):
+        callback = AsyncMock()
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        adapter._is_interactive_user_authorized = MagicMock(return_value=True)
+        result, registered = _connect_with_recording_app(
+            adapter,
+            plugin_handlers=[("meeting_action", callback, "meeting_reports")],
+        )
+        assert result is True
+        wrapped = dict(registered)["meeting_action"]
+        ack = AsyncMock()
+        body = {"user": {"id": "U_OK"}, "channel": {"id": "C1"}}
+        action = {"action_id": "meeting_action"}
+        asyncio.run(wrapped(ack, body, action, AsyncMock()))
+        callback.assert_awaited_once_with(ack, body, action)
+
+    def test_plugin_view_handler_is_wired_for_note_modals(self):
+        callback = AsyncMock()
+        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        adapter = SlackAdapter(config)
+        views = []
+        result, _registered = _connect_with_recording_app(
+            adapter,
+            plugin_handlers=[],
+            plugin_view_handlers=[
+                ("meeting_report_review_notes", callback, "meeting_reports")
+            ],
+            registered_views=views,
+        )
+        assert result is True
+        assert [callback_id for callback_id, _callback in views] == [
+            "meeting_report_review_notes"
+        ]
 
 
     def test_plugin_loader_failure_does_not_break_connect(self):
