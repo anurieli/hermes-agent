@@ -174,6 +174,15 @@ class MeetingReport:
     proposed_delegations: list[ProposedDelegation] = field(default_factory=list)
     confidence: Optional[str] = None
     confidence_notes: Optional[str] = None
+    # Filing verdict: free-text status of whether/how this report's content
+    # was filed into a destination system (e.g. "filed", "partially_filed",
+    # "not_filed"). None when the source pipeline doesn't file anywhere.
+    filing_verdict: Optional[str] = None
+    # Exact destinations the report's content was filed to, e.g.
+    # "Notion: Meeting Notes / Q3 Planning" or a destination URL. Plain
+    # strings, same shape as ``decisions``. This is a record of what
+    # already happened, never a dispatch instruction.
+    filed_destinations: list[str] = field(default_factory=list)
     created_at: datetime = field(default_factory=utc_now)
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     review: ReviewState = field(default_factory=ReviewState)
@@ -213,6 +222,12 @@ class MeetingReport:
         self.confidence_notes = (
             str(self.confidence_notes).strip() if self.confidence_notes else None
         )
+        self.filing_verdict = (
+            str(self.filing_verdict).strip() if self.filing_verdict else None
+        )
+        self.filed_destinations = [
+            str(x).strip() for x in self.filed_destinations if str(x).strip()
+        ]
         self.report_html_path = (
             str(self.report_html_path) if self.report_html_path else None
         )
@@ -245,6 +260,8 @@ class MeetingReport:
             ],
             "confidence": self.confidence,
             "confidence_notes": self.confidence_notes,
+            "filing_verdict": self.filing_verdict,
+            "filed_destinations": list(self.filed_destinations),
             "created_at": _iso(self.created_at),
             "ttl_seconds": self.ttl_seconds,
             "expires_at": _iso(self.expires_at),
@@ -277,6 +294,8 @@ class MeetingReport:
             ],
             confidence=value.get("confidence"),
             confidence_notes=value.get("confidence_notes"),
+            filing_verdict=value.get("filing_verdict"),
+            filed_destinations=list(value.get("filed_destinations") or []),
             created_at=_parse_datetime(value.get("created_at"), fallback=utc_now()),
             ttl_seconds=int(value.get("ttl_seconds", DEFAULT_TTL_SECONDS)),
             review=ReviewState.from_dict(value.get("review")),

@@ -18,15 +18,31 @@ Create one `PipelineEventLog` for the run. Record transcript retrieval, archive 
 
 Do not forward kanban lifecycle notifications or child-agent attachments as meeting output. The only routed completion event is `meeting:report_ready`.
 
+`PipelineEventLog` is in-process bookkeeping only. It cannot suppress a real kanban task's own lifecycle events. If Penny's existing pipeline dispatches Granola/Pocket/Google Meet processing (or any per-source worker) as kanban tasks, create the parent task and every child with `notify_mode="silent"` (children of a silent parent can pass `notify_mode="inherit"` instead of repeating `"silent"`):
+
+```python
+parent_id = kb.create_task(
+    conn, title="Process Granola meeting", assignee="penny-worker",
+    notify_mode="silent",
+)
+child_id = kb.create_task(
+    conn, title="Summarize transcript", parents=(parent_id,),
+    assignee="penny-worker", notify_mode="inherit",
+)
+```
+
+An ordinary kanban task (`notify_mode` omitted or `"default"`) still notifies its subscribers exactly as before. That default must not change for any OTHER task on Penny's board. Only the tasks that back a "Process" run should be created silent. Verify this with a real gateway notifier tick against a test board, not by reading the dispatching code: create the silent task, complete/block/crash it, run one `_kanban_notifier_watcher` tick, and confirm the subscribed adapter received nothing.
+
 ## 3. Generate the report at the plugin edge
 
 After Penny's existing summary payload is complete:
 
 1. map summary, decisions, owned action items, and proposed delegations into `generate_report`
 2. preserve the source meeting id and archive reference in `source`
-3. expose the generated HTML through a session-checked route that checks `store.is_available(report_id)`
-4. pass that URL as `report_url`
-5. retain the canonical JSON in Penny's `$HERMES_HOME/meeting_reports/`
+3. if Penny's pipeline already files action items or notes somewhere (a doc, a tracker), pass the outcome as `filing_verdict` (e.g. `"filed"`, `"not_filed"`) and the exact locations as `filed_destinations`
+4. expose the generated HTML through a session-checked route that checks `store.is_available(report_id)`
+5. pass that URL as `report_url`
+6. retain the canonical JSON in Penny's `$HERMES_HOME/meeting_reports/`
 
 Do not attach `review.md`, transcript text, source JSON, or child-agent artifacts to the chat by default.
 
@@ -60,12 +76,15 @@ Before switching production delivery:
 - action-item owner and due fields survive the canonical round trip
 - proposed delegations have no dispatch fields
 - internal stage events produce no user-facing messages
-- one report-ready event produces one compact card in the originating thread
+- the underlying kanban task(s) for a "Process" run are created with `notify_mode="silent"` (or `"inherit"` for children), and completing/blocking/crashing one produces no notifier delivery
+- an ordinary (non-meeting) kanban task on the same board still notifies exactly as before
+- one report-ready event produces one compact card in the originating thread, carrying the filing verdict and exact filed destinations
 - Slack and Telegram accept/reject actions persist a verdict
 - both platforms collect notes through their native input flow
 - duplicate and conflicting clicks leave the first terminal verdict unchanged
 - Dismiss hides the card without changing review state
 - no raw transcript, JSON, or child artifact is sent by default
+- no start acknowledgment, task id, or parent/child completion ping reaches the originating chat
 - expired reports fail availability checks
 - cleanup removes JSON and HTML and revokes the published URL
 

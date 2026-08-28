@@ -59,11 +59,31 @@ def test_canonical_json_includes_required_fields():
         "decisions",
         "action_items",
         "proposed_delegations",
+        "filing_verdict",
+        "filed_destinations",
         "ttl_seconds",
         "expires_at",
         "review",
     ):
         assert key in payload, key
+
+
+def test_filing_verdict_and_destinations_round_trip():
+    report = _sample_report(
+        filing_verdict="filed",
+        filed_destinations=["Notion: Meeting Notes / Weekly Sync", "  "],
+    )
+    # Blank entries are dropped, same cleaning rule as decisions/participants.
+    assert report.filed_destinations == ["Notion: Meeting Notes / Weekly Sync"]
+    restored = MeetingReport.from_dict(report.to_dict())
+    assert restored.filing_verdict == "filed"
+    assert restored.filed_destinations == ["Notion: Meeting Notes / Weekly Sync"]
+
+
+def test_filing_verdict_and_destinations_default_empty():
+    report = _sample_report()
+    assert report.filing_verdict is None
+    assert report.filed_destinations == []
 
 
 def test_expires_at_derived_from_created_at_plus_ttl():

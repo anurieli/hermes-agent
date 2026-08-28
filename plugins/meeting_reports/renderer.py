@@ -49,6 +49,14 @@ def _action_items_table(report: MeetingReport) -> str:
     )
 
 
+def _filing_section(report: MeetingReport) -> str:
+    verdict = report.filing_verdict or "not filed"
+    if not report.filed_destinations:
+        return f"<p>{_e(verdict)}</p>"
+    destinations = "".join(f"<li>{_e(dest)}</li>" for dest in report.filed_destinations)
+    return f"<p>{_e(verdict)}</p><ul>{destinations}</ul>"
+
+
 def _delegations_table(report: MeetingReport) -> str:
     if not report.proposed_delegations:
         return '<p class="muted">No delegations proposed.</p>'
@@ -143,6 +151,9 @@ def render_html(report: MeetingReport) -> str:
 
   <h2>Decisions</h2>
   {_list_items(report.decisions)}
+
+  <h2>Filing</h2>
+  {_filing_section(report)}
 
   <h2>Action items</h2>
   {_action_items_table(report)}

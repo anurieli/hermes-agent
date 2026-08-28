@@ -43,6 +43,14 @@ def _first_summary_line(summary: str, max_chars: int = 180) -> str:
     return text[: max_chars - 1].rstrip() + "…"
 
 
+def _filing_line(report: MeetingReport) -> str:
+    verdict = report.filing_verdict or "not filed"
+    line = f"Filing: {verdict}"
+    if report.filed_destinations:
+        line += "\nFiled to: " + "; ".join(report.filed_destinations)
+    return line
+
+
 def build_completion_card(report: MeetingReport) -> CompletionCard:
     counts = (
         f"Decisions: {len(report.decisions)}  |  "
@@ -50,7 +58,10 @@ def build_completion_card(report: MeetingReport) -> CompletionCard:
         f"Proposed delegations: {len(report.proposed_delegations)}"
     )
     expiry = report.expires_at.strftime("%Y-%m-%d %H:%M UTC")
-    body = f"{_first_summary_line(report.summary)}\n{counts}\nAvailable until {expiry}."
+    body = (
+        f"{_first_summary_line(report.summary)}\n{counts}\n"
+        f"{_filing_line(report)}\nAvailable until {expiry}."
+    )
     buttons = REVIEW_ACTIONS if not report.review.terminal else ()
     return CompletionCard(
         report_id=report.report_id,

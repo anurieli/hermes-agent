@@ -43,6 +43,22 @@ def test_completion_card_counts_are_accurate():
     assert "Proposed delegations: 1" in card.body
 
 
+def test_completion_card_shows_filing_verdict_and_exact_destinations():
+    card = build_completion_card(
+        _report(
+            filing_verdict="filed",
+            filed_destinations=["Notion: Meeting Notes / Weekly Sync"],
+        )
+    )
+    assert "Filing: filed" in card.body
+    assert "Notion: Meeting Notes / Weekly Sync" in card.body
+
+
+def test_completion_card_shows_not_filed_when_verdict_absent():
+    card = build_completion_card(_report())
+    assert "Filing: not filed" in card.body
+
+
 def test_pending_report_gets_all_review_and_dismiss_actions():
     card = build_completion_card(_report())
     assert [action for action, _label in card.buttons] == [

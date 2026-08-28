@@ -1276,6 +1276,7 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    notify_mode = args.get("notify_mode")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1341,6 +1342,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                notify_mode=notify_mode,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1350,6 +1352,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                notify_mode=new_task.notify_mode if new_task else None,
                 subscribed=subscribed,
             )
         finally:
@@ -2064,6 +2067,20 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "notify_mode": {
+                "type": "string",
+                "enum": ["default", "silent", "inherit"],
+                "description": (
+                    "'default' (unchanged: the gateway notifier delivers "
+                    "terminal events, worker summaries, and artifacts to "
+                    "subscribers). 'silent' makes the notifier fail closed "
+                    "for this task: no terminal-event delivery, no worker "
+                    "summary, no artifacts. 'inherit' (only valid with "
+                    "'parents') copies the mode from the parent tasks: "
+                    "silent if any parent is silent, default otherwise. "
+                    "Omit for 'default'."
                 ),
             },
             "skills": {

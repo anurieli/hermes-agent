@@ -11,12 +11,22 @@ marks it ``silent=False``, and even then nothing here sends anything - it's
 the pipeline's job to route the one non-silent event to
 ``deliver_completion_card``.
 
-Kanban interop: when a meeting run is itself dispatched as a kanban task,
-its worker's own ``task_events`` rows are already filtered the same way -
-``gateway.kanban_watchers`` only ever delivers a fixed ``TERMINAL_KINDS``
-set to chat, and every internal kanban event kind we emit here
-(``"meeting:*"``) is deliberately outside that set. :func:`is_kanban_silent`
-lets a caller verify that at runtime instead of hardcoding the assumption.
+Kanban interop: this module's own bookkeeping (``PipelineEventLog``) is
+entirely in-process and never touches the ``tasks``/``task_events`` tables,
+so it cannot by itself silence a meeting run's underlying kanban work. If a
+meeting run is dispatched as one or more real kanban tasks (a parent task,
+worker/child tasks, or both), those tasks emit their OWN ``completed`` /
+``blocked`` / ``crashed`` / ``timed_out`` events through the normal kanban
+lifecycle regardless of what this module records. An ordinary child task
+still notifies its subscribers by default. The only way to keep that traffic
+out of chat is to create those kanban tasks with
+``notify_mode="silent"`` (or ``"inherit"`` for children of a silent parent);
+see ``hermes_cli.kanban_db.create_task`` / ``decompose_triage_task`` and
+``gateway.kanban_watchers._is_notify_silent``, which is what actually gates
+delivery. :func:`is_kanban_silent` only tells you whether a *kind string* is
+one of kanban's own ``TERMINAL_KINDS``. It is useful for asserting this module's
+``"meeting:*"`` kinds never collide with that set, not for suppressing a
+dispatched task's real lifecycle events.
 """
 
 from __future__ import annotations

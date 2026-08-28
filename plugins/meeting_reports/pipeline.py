@@ -34,6 +34,8 @@ def generate_report(
     proposed_delegations: Optional[Sequence[Any]] = None,
     confidence: Optional[str] = None,
     confidence_notes: Optional[str] = None,
+    filing_verdict: Optional[str] = None,
+    filed_destinations: Optional[Sequence[str]] = None,
     report_url: Optional[str] = None,
     report_id: Optional[str] = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
@@ -54,6 +56,8 @@ def generate_report(
         proposed_delegations=coerce_delegations(proposed_delegations),
         confidence=confidence,
         confidence_notes=confidence_notes,
+        filing_verdict=filing_verdict,
+        filed_destinations=list(filed_destinations or []),
         report_url=report_url,
         ttl_seconds=ttl_seconds,
     )
@@ -148,6 +152,8 @@ def to_card_data(report: MeetingReport) -> dict[str, Any]:
         "title": card.title,
         "body": card.body,
         "report_url": card.report_url,
+        "filing_verdict": report.filing_verdict,
+        "filed_destinations": list(report.filed_destinations),
         "buttons": [
             {"action": action, "label": label} for action, label in card.buttons
         ],

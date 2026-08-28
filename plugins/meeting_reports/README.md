@@ -39,6 +39,8 @@ report = generate_report(
         }
         for suggestion in suggestions
     ],
+    filing_verdict="filed",
+    filed_destinations=["Notion: Meeting Notes / Weekly Sync"],
     # Production integrations should expose the generated HTML through a
     # session-checked route that enforces the same 24-hour TTL.
     report_url=report_url,
@@ -60,6 +62,19 @@ for event in log.events:
 
 `run_silent_fanout(...)` concurrently awaits source-selected processing workers or subagents and records only silent lifecycle events. It accepts coroutines supplied by the existing source pipeline. It never reads or dispatches the report's `proposed_delegations`.
 
+### Keeping dispatched kanban work silent
+
+`PipelineEventLog` is in-process bookkeeping only. It never touches the kanban `tasks`/`task_events` tables. If the source pipeline dispatches any part of meeting processing as real kanban tasks (a parent task, per-source worker/child tasks, or both), those are ordinary kanban tasks and notify their subscribers by default like any other task. To keep that traffic out of chat, create them with the generic kanban `notify_mode` field:
+
+```python
+kb.create_task(conn, title="Process Granola meeting", assignee="penny-worker",
+                notify_mode="silent")
+kb.create_task(conn, title="Summarize transcript", parents=(parent_id,),
+                assignee="penny-worker", notify_mode="inherit")
+```
+
+`notify_mode="silent"` makes the gateway notifier fail closed for that task on every adapter: no terminal-event text ping, no decision card, no worker-summary text, and no artifact upload. `notify_mode="inherit"` (valid only with `parents`) copies silence down from a silent parent, so a decomposed fan-out of a silent orchestration task stays silent by default. The one message the user should see is the completion card `route_pipeline_event` delivers for `meeting:report_ready`. See `hermes_cli.kanban_db.create_task` and `gateway.kanban_watchers._is_notify_silent` for the full contract.
+
 ## Canonical schema
 
 The JSON report includes:
@@ -69,6 +84,7 @@ The JSON report includes:
 - owned action items
 - proposed delegations
 - confidence and optional confidence notes
+- filing verdict and exact filed destinations
 - review state
 - creation time, expiry time, and TTL
 - optional externally published `report_url`
@@ -76,12 +92,15 @@ The JSON report includes:
 
 `proposed_delegations` are suggestions only. They contain no task id, dispatched flag, or execution status. Accepting a report changes only its review state. No review path imports or calls `delegate_task`.
 
+`filing_verdict` and `filed_destinations` describe work the source pipeline already did (e.g. filed action items to a doc or tracker) before calling `generate_report`. Like `proposed_delegations`, they are a record of what happened, never an instruction to dispatch anything.
+
 ## Completion card
 
 Telegram and Slack expose `send_meeting_report_card(...)`. The card is compact and contains:
 
 - one report link when a TTL-bound `report_url` is supplied
 - summary plus counts, not raw JSON or attachment dumps
+- the filing verdict and exact filed destinations
 - Accept
 - Accept with notes
 - Reject
