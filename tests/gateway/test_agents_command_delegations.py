@@ -8,6 +8,7 @@ live sampling → /agents rendering.
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,7 +42,13 @@ def _make_runner():
 
 
 class _Event:
-    source = None
+    source = SimpleNamespace(
+        profile="default",
+        platform=SimpleNamespace(value="slack"),
+        chat_id="test",
+        thread_id=None,
+        user_id="test",
+    )
 
 
 @pytest.mark.asyncio

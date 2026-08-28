@@ -7757,7 +7757,7 @@ def _cmdline_is_cody_worker(pid: int) -> Optional[bool]:
     if sys.platform != "linux":
         return None
     try:
-        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:  # windows-footgun: ok
             raw = f.read()
     except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
         return None

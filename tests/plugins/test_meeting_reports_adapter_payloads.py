@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 from plugins.meeting_reports.cards import REVIEW_ACTIONS
 from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.telegram import adapter as telegram_adapter
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -48,7 +49,17 @@ def test_slack_native_card_has_report_link_unique_actions_and_thread_origin():
     assert by_action_id["meeting_report_review_reject"]["style"] == "danger"
 
 
-def test_telegram_native_card_has_report_link_callbacks_and_topic_origin():
+def test_telegram_native_card_has_report_link_callbacks_and_topic_origin(monkeypatch):
+    monkeypatch.setattr(
+        telegram_adapter,
+        "InlineKeyboardButton",
+        lambda text, **kwargs: SimpleNamespace(text=text, **kwargs),
+    )
+    monkeypatch.setattr(
+        telegram_adapter,
+        "InlineKeyboardMarkup",
+        lambda rows: SimpleNamespace(inline_keyboard=rows),
+    )
     adapter = TelegramAdapter.__new__(TelegramAdapter)
     adapter._bot = object()
     adapter._reply_to_mode = "off"
