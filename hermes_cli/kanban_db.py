@@ -134,6 +134,15 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Persisted notification modes (``tasks.notify_mode``). ``default`` preserves
+# every existing gateway-notifier behaviour. ``silent`` makes the notifier
+# fail closed for the task: no terminal-event delivery, no worker summary, no
+# artifacts (see ``gateway.kanban_watchers._is_notify_silent``). ``inherit``
+# is accepted only as a ``create_task`` / decompose-child input value; it
+# resolves to a concrete mode at creation time and is never itself stored.
+NOTIFY_MODES = {"default", "silent"}
+NOTIFY_MODE_INPUTS = NOTIFY_MODES | {"inherit"}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -994,6 +1003,15 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Persisted notification mode: one of ``NOTIFY_MODES`` (``"default"`` or
+    # ``"silent"``). ``"default"`` preserves every existing behavior: the
+    # gateway notifier delivers terminal events, worker summaries, and
+    # artifacts to subscribers as before. ``"silent"`` makes the gateway
+    # notifier fail closed for this task; see
+    # ``gateway.kanban_watchers._is_notify_silent``. Set at creation via
+    # ``create_task(notify_mode=...)`` / ``decompose_triage_task`` children;
+    # never mutated afterward.
+    notify_mode: str = "default"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1090,6 +1108,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            notify_mode=(
+                row["notify_mode"]
+                if "notify_mode" in keys and row["notify_mode"]
+                else "default"
             ),
         )
 
@@ -1281,7 +1304,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Persisted notification mode: 'default' (unchanged existing behaviour;
+    -- the gateway notifier delivers terminal events, worker summaries, and
+    -- artifacts) or 'silent' (the notifier fails closed for this task; see
+    -- gateway.kanban_watchers._is_notify_silent). Set once at creation.
+    notify_mode          TEXT NOT NULL DEFAULT 'default'
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2485,6 +2513,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "notify_mode" not in cols:
+        # Existing rows get 'default', preserving every existing notifier
+        # behaviour for tasks created before this column existed.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "notify_mode",
+            "notify_mode TEXT NOT NULL DEFAULT 'default'",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2922,6 +2960,7 @@ def create_task(
     project_id: Optional[str] = None,
     deployment_target: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    notify_mode: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2961,6 +3000,15 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``notify_mode`` is one of ``"default"`` (unchanged existing behaviour;
+    the gateway notifier delivers terminal events, worker summaries, and
+    artifacts to subscribers), ``"silent"`` (the notifier fails closed for
+    this task; see ``gateway.kanban_watchers._is_notify_silent``), or
+    ``"inherit"`` (only valid with ``parents``; the child's mode is
+    ``"silent"`` if ANY parent is silent, otherwise ``"default"``).
+    ``None`` (the default) means ``"default"``. Only ``"default"`` and
+    ``"silent"`` are ever persisted; ``"inherit"`` is resolved here.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3102,6 +3150,36 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+
+    # Validate and resolve notify_mode. Only "default" and "silent" are ever
+    # persisted; "inherit" is resolved here into one of those two, and is
+    # only meaningful with at least one parent. notify_mode is immutable
+    # once a task is created (see the Task.notify_mode docstring), so
+    # reading parents' current values ahead of the write_txn below carries
+    # no meaningful race because a parent's mode cannot change out from under us.
+    notify_mode_input = (notify_mode or "default").strip().lower()
+    if notify_mode_input not in NOTIFY_MODE_INPUTS:
+        raise ValueError(
+            f"notify_mode must be one of {sorted(NOTIFY_MODE_INPUTS)}, "
+            f"got {notify_mode!r}"
+        )
+    if notify_mode_input == "inherit":
+        if not parents:
+            raise ValueError("notify_mode='inherit' requires at least one parent task")
+        placeholders = ",".join("?" * len(parents))
+        parent_modes = conn.execute(
+            f"SELECT notify_mode FROM tasks WHERE id IN ({placeholders})",
+            parents,
+        ).fetchall()
+        # Any silent parent makes the child silent too. Fail closed rather
+        # than default to "default" when parents disagree.
+        resolved_notify_mode = (
+            "silent"
+            if any((r["notify_mode"] or "default") == "silent" for r in parent_modes)
+            else "default"
+        )
+    else:
+        resolved_notify_mode = notify_mode_input
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3249,8 +3327,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, notify_mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3277,6 +3355,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        resolved_notify_mode,
                     ),
                 )
                 for pid in parents:
@@ -3301,6 +3380,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "notify_mode": resolved_notify_mode,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -6506,7 +6586,13 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
             "parents": [0, 2],                 # indices into this same children list
+            "notify_mode": "silent",           # optional, default inherits the root's
         }
+
+    Each child's ``notify_mode`` defaults to inheriting the root task's
+    ``notify_mode`` (so decomposing a silent orchestration task produces
+    silent children by default). Pass ``"default"`` or ``"silent"``
+    explicitly to override that inheritance for one child.
 
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
@@ -6534,6 +6620,12 @@ def decompose_triage_task(
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
+        child_notify_mode_raw = child.get("notify_mode")
+        if child_notify_mode_raw is not None and child_notify_mode_raw not in NOTIFY_MODE_INPUTS:
+            raise ValueError(
+                f"child[{idx}].notify_mode must be one of {sorted(NOTIFY_MODE_INPUTS)} "
+                f"or omitted to inherit the root's, got {child_notify_mode_raw!r}"
+            )
         for p in parents_idx:
             if not isinstance(p, int) or p < 0 or p >= len(children):
                 raise ValueError(
@@ -6576,7 +6668,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, notify_mode "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6585,6 +6677,7 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        root_notify_mode = root_row["notify_mode"] or "default"
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -6622,11 +6715,18 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Per-child override wins; omitted or "inherit" copies the root's
+            # notify_mode (see docstring). Already validated above.
+            child_notify_mode_raw = child.get("notify_mode")
+            if child_notify_mode_raw in (None, "inherit"):
+                child_notify_mode = root_notify_mode
+            else:
+                child_notify_mode = child_notify_mode_raw
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, notify_mode) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6637,11 +6737,16 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    child_notify_mode,
                 ),
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "notify_mode": child_notify_mode,
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
@@ -7652,7 +7757,7 @@ def _cmdline_is_cody_worker(pid: int) -> Optional[bool]:
     if sys.platform != "linux":
         return None
     try:
-        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:  # windows-footgun: ok
             raw = f.read()
     except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
         return None

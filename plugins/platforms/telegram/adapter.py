@@ -4787,6 +4787,60 @@ class TelegramAdapter(BasePlatformAdapter):
         state["card_message_id"] = int(msg.message_id)
         return SendResult(success=True, message_id=str(msg.message_id))
 
+    async def send_meeting_report_card(
+        self,
+        *,
+        chat_id: str,
+        report_id: str,
+        title: str,
+        body: str,
+        buttons: "list[tuple[str, str]] | tuple[tuple[str, str], ...]",
+        report_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send the portable meeting-report kit's compact completion card.
+
+        Stateless by design: unlike ``send_kanban_decision_card`` there is
+        no in-memory state dict to keep in sync. ``report_id`` alone is
+        enough for ``plugins.meeting_reports.handlers.handle_telegram_callback``
+        to reload the report from disk when a button is tapped. See
+        ``plugins/meeting_reports/cards.py`` for the callback_data contract.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        from plugins.meeting_reports.cards import telegram_callback_data
+
+        rows = []
+        if report_url:
+            rows.append([InlineKeyboardButton("Open report", url=report_url)])
+        rows.extend([
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=telegram_callback_data(action, report_id),
+                )
+            ]
+            for action, label in buttons
+        ])
+        keyboard = InlineKeyboardMarkup(rows) if rows else None
+        text = f"{title}\n{body}"
+        thread_id = self._metadata_thread_id(metadata)
+        try:
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                reply_markup=keyboard,
+                **self._thread_kwargs_for_send(
+                    chat_id, thread_id, metadata, reply_to_mode=self._reply_to_mode,
+                ),
+                **self._notification_kwargs({**(metadata or {}), "notify": True}),
+                **self._link_preview_kwargs(),
+            )
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc), retryable=True)
+        return SendResult(success=True, message_id=str(msg.message_id))
+
     @staticmethod
     def _answer_kanban_decision_sync(
         state: Dict[str, Any], *, author: str, answer: str
@@ -7799,6 +7853,50 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return
 
+        # --- Plugin-provided callback handlers ---
+        #
+        # Plugins call ``ctx.register_telegram_callback_handler(prefix, cb)``
+        # at register() time; checked here, after every built-in prefix has
+        # failed to match, so plugins can never shadow a core callback shape.
+        # Each callback is wrapped so a misbehaving plugin can't take down
+        # the gateway: any exception inside it is caught and logged, and the
+        # tap is still acknowledged so the user doesn't see a stuck spinner.
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            _plugin_handlers = get_plugin_manager().get_telegram_callback_handlers()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("[Telegram] Could not load plugin callback handlers: %s", e)
+            _plugin_handlers = []
+        for _prefix, _cb, _plugin_name in _plugin_handlers:
+            # update_prompt is the final core callback branch below. Keep it
+            # reserved even if a plugin registers an overlapping prefix.
+            if data.startswith("update_prompt:"):
+                break
+            if not data.startswith(_prefix):
+                continue
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="You are not authorized for this action.")
+                return
+            try:
+                await _cb(self, query, data)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error(
+                    "[Telegram] Plugin '%s' callback handler raised: %s",
+                    _plugin_name, exc, exc_info=True,
+                )
+                try:
+                    await query.answer(text="This action failed. Please try again.")
+                except Exception:
+                    pass
+            return
+
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
             return
@@ -9968,6 +10066,28 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        # Let plugins consume replies to their own bounded ForceReply prompts
+        # before the text enters ordinary agent batching. Interceptors only run
+        # after the normal user authorization gate above.
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            _text_interceptors = (
+                get_plugin_manager().get_telegram_text_interceptors()
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "[Telegram] Could not load plugin text interceptors: %s", exc,
+            )
+            _text_interceptors = []
+        for _callback, _plugin_name in _text_interceptors:
+            try:
+                if await _callback(self, msg):
+                    return
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.error(
+                    "[Telegram] Plugin '%s' text interceptor raised: %s",
+                    _plugin_name, exc, exc_info=True,
+                )
         if await self._consume_kanban_decision_reply(msg):
             return
         if not self._should_process_message(msg):

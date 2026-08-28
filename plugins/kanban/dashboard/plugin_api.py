@@ -616,6 +616,10 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # "default" (unchanged notifier behaviour), "silent" (gateway notifier
+    # fails closed for this task), or "inherit" (copy from parents). None ->
+    # "default".
+    notify_mode: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -644,6 +648,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            notify_mode=payload.notify_mode,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)

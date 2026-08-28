@@ -2130,16 +2130,35 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 _plugin_handlers = []
 
-            # Closure factory — keeps the wrapper's signature limited to
-            # ``(ack, body, action)``. slack_bolt inspects listener
+            # Closure factory keeps the wrapper's signature limited to names
+            # Slack Bolt recognizes. slack_bolt inspects listener
             # signatures via ``inspect.signature`` and passes ``None`` for
             # any parameter name it doesn't recognise, so capturing loop
             # vars as default args (``_cb=_cb`` etc.) silently clobbers
             # them at dispatch time.
             def _make_wrapper(cb, plugin_name):
-                async def _wrapped(ack, body, action):
+                _accepts_client = "client" in inspect.signature(cb).parameters
+
+                async def _wrapped(ack, body, action, client):
                     try:
-                        await cb(ack, body, action)
+                        user = body.get("user") or {}
+                        channel = body.get("channel") or {}
+                        if not self._is_interactive_user_authorized(
+                            str(user.get("id") or ""),
+                            channel_id=str(channel.get("id") or ""),
+                            user_name=user.get("name"),
+                            team_id=self._event_team_id({}, body),
+                        ):
+                            logger.warning(
+                                "[Slack] Unauthorized plugin action click by %s (%s)",
+                                user.get("name"), user.get("id"),
+                            )
+                            await ack()
+                            return
+                        if _accepts_client:
+                            await cb(ack, body, action, client=client)
+                        else:
+                            await cb(ack, body, action)
                     except Exception as exc:  # pragma: no cover - defensive
                         logger.error(
                             "[Slack] Plugin '%s' action handler raised: %s",
@@ -2162,6 +2181,64 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.info(
                     "[Slack] Wired %d plugin action handler(s)",
                     len(_plugin_handlers),
+                )
+
+            # Register plugin-provided modal view-submission handlers. These
+            # use a separate registry because Slack routes modal submissions
+            # through app.view(), not app.action().
+            try:
+                from hermes_cli.plugins import get_plugin_manager as _get_plugin_manager
+                _plugin_view_handlers = _get_plugin_manager().get_slack_view_handlers()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "[Slack] Could not load plugin view handlers: %s", e,
+                )
+                _plugin_view_handlers = []
+
+            def _make_view_wrapper(cb, plugin_name):
+                _accepts_client = "client" in inspect.signature(cb).parameters
+
+                async def _wrapped(ack, body, view, client):
+                    try:
+                        user = body.get("user") or {}
+                        if not self._is_interactive_user_authorized(
+                            str(user.get("id") or ""),
+                            user_name=user.get("name"),
+                            team_id=self._event_team_id({}, body),
+                        ):
+                            logger.warning(
+                                "[Slack] Unauthorized plugin view submission by %s (%s)",
+                                user.get("name"), user.get("id"),
+                            )
+                            await ack()
+                            return
+                        if _accepts_client:
+                            await cb(ack, body, view, client=client)
+                        else:
+                            await cb(ack, body, view)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.error(
+                            "[Slack] Plugin '%s' view handler raised: %s",
+                            plugin_name, exc, exc_info=True,
+                        )
+                        try:
+                            await ack()
+                        except Exception:
+                            pass
+                return _wrapped
+
+            for _callback_id, _cb, _plugin_name in _plugin_view_handlers:
+                self._app.view(_callback_id)(
+                    _make_view_wrapper(_cb, _plugin_name)
+                )
+                logger.debug(
+                    "[Slack] Registered plugin view handler %s (from %s)",
+                    _callback_id, _plugin_name,
+                )
+            if _plugin_view_handlers:
+                logger.info(
+                    "[Slack] Wired %d plugin view handler(s)",
+                    len(_plugin_view_handlers),
                 )
 
             # Bring up the handler and watchdog atomically. ``_running`` only
@@ -6688,6 +6765,83 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
             logger.error("[Slack] send_clarify failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def send_meeting_report_card(
+        self,
+        *,
+        chat_id: str,
+        report_id: str,
+        title: str,
+        body: str,
+        buttons: "list[tuple[str, str]] | tuple[tuple[str, str], ...]",
+        report_url: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send the portable meeting-report kit's compact completion card.
+
+        Review buttons use unique action ids and carry
+        ``"<action>:<report_id>"`` values. The plugin handler resolves the
+        canonical report from disk and edits this message through Slack's
+        response URL.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        from plugins.meeting_reports.cards import (
+            SLACK_ACTION_PREFIX,
+            SLACK_OPEN_ACTION_ID,
+            slack_action_value,
+        )
+
+        try:
+            chat_id = await self._ensure_dm_conversation(
+                chat_id, team_id=self._metadata_team_id(metadata)
+            )
+            thread_ts = self._resolve_thread_ts(None, metadata)
+            text = f"{title}\n{body}"
+            blocks: list = [
+                {
+                    "type": "section",
+                    "text": {"type": "plain_text", "text": text, "emoji": True},
+                },
+            ]
+            elements: list[dict[str, Any]] = []
+            if report_url:
+                elements.append(
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Open report", "emoji": True},
+                        "action_id": SLACK_OPEN_ACTION_ID,
+                        "url": report_url,
+                    }
+                )
+            for action, label in buttons:
+                element: Dict[str, Any] = {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": label, "emoji": True},
+                    "action_id": f"{SLACK_ACTION_PREFIX}{action}",
+                    "value": slack_action_value(action, report_id),
+                }
+                if action == "accept":
+                    element["style"] = "primary"
+                elif action == "reject":
+                    element["style"] = "danger"
+                elements.append(element)
+            for start in range(0, len(elements), 5):
+                blocks.append({"type": "actions", "elements": elements[start:start + 5]})
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": text,
+                "blocks": blocks,
+                "mrkdwn": False,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            return SendResult(success=True, message_id=result.get("ts", ""), raw_response=result)
+        except Exception as e:
+            logger.error("[Slack] send_meeting_report_card failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
     def _is_interactive_user_authorized(

@@ -1096,6 +1096,117 @@ class PluginContext:
             action_id,
         )
 
+    def register_slack_view_handler(
+        self,
+        callback_id: Any,
+        callback: Callable,
+    ) -> None:
+        """Register a Slack modal view-submission handler from a plugin.
+
+        The callback follows Slack Bolt's ``(ack, body, view)`` convention.
+        It may also accept a keyword-only ``client`` argument when it needs
+        the workspace-scoped Web API client supplied by Bolt.
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Slack "
+                "view handler with a non-callable callback."
+            )
+        if callback_id is None or (
+            isinstance(callback_id, str) and not callback_id.strip()
+        ):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Slack "
+                "view handler with an empty callback_id."
+            )
+        self._manager._slack_view_handlers.append(
+            (callback_id, callback, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered Slack view handler: %s",
+            self.manifest.name,
+            callback_id,
+        )
+
+    # -- telegram callback handler registration ------------------------------
+
+    def register_telegram_callback_handler(
+        self,
+        prefix: str,
+        callback: Callable,
+    ) -> None:
+        """Register a Telegram inline-keyboard callback handler from a plugin.
+
+        Hermes' Telegram adapter checks ``callback_data.startswith(prefix)``
+        in ``_handle_callback_query`` for any tap that doesn't match one of
+        its own built-in prefixes (``kb:``, ``ea:``, ``sc:``, ``cl:``, ...).
+        Keep ``prefix`` short and namespaced (e.g. ``"mtgrpt:"``). Telegram
+        caps ``callback_data`` at 64 bytes total.
+
+        Callback signature::
+
+            async def handler(adapter, query, data) -> None:
+                # adapter: the live TelegramAdapter instance (chat_id,
+                #   query.message, query.from_user, self.build_source(), etc.)
+                # query: the raw telegram.Update.callback_query
+                # data: the full callback_data string
+                await query.answer(text="Done.")
+
+        Args:
+            prefix: literal string prefix to match against ``callback_data``.
+            callback: async callable receiving ``(adapter, query, data)``.
+
+        Raises:
+            ValueError: if ``callback`` is not callable, or ``prefix`` is
+                empty.
+
+        Example::
+
+            async def _on_review_tap(adapter, query, data):
+                await query.answer(text="Recorded.")
+
+            ctx.register_telegram_callback_handler("mtgrpt:", _on_review_tap)
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback handler with a non-callable callback."
+            )
+        if not prefix or not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                f"callback handler with an empty prefix."
+            )
+        self._manager._telegram_callback_handlers.append(
+            (prefix, callback, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered Telegram callback handler: %s",
+            self.manifest.name,
+            prefix,
+        )
+
+    def register_telegram_text_interceptor(self, callback: Callable) -> None:
+        """Register an authorized inbound-text interceptor.
+
+        The callback receives ``(adapter, message)`` and returns truthy when
+        it consumed the message. Interceptors run after user authorization and
+        before ordinary agent dispatch. They are intended for bounded replies
+        to plugin-owned ForceReply prompts, not general message handling.
+        """
+        if not callable(callback):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' tried to register a Telegram "
+                "text interceptor with a non-callable callback."
+            )
+        self._manager._telegram_text_interceptors.append(
+            (callback, self.manifest.name)
+        )
+        logger.debug(
+            "Plugin %s registered Telegram text interceptor",
+            self.manifest.name,
+        )
+
     # -- hook registration --------------------------------------------------
 
     # -- auxiliary task registration ---------------------------------------
@@ -1333,6 +1444,22 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        # Slack modal view handlers registered by plugins. Each entry is
+        # (callback_id, callback, plugin_name).
+        self._slack_view_handlers: List[tuple] = []
+        # Telegram inline-keyboard callback handlers registered by plugins.
+        # Each entry is (prefix, callback, plugin_name); the Telegram adapter
+        # checks ``callback_data.startswith(prefix)`` in
+        # ``_handle_callback_query`` after its own built-in prefixes (kb:,
+        # ea:, sc:, cl:, ...) fail to match. ``callback`` is an async
+        # function ``(adapter, query, data) -> None``. ``adapter`` is the
+        # live TelegramAdapter instance, ``query`` is the raw
+        # ``telegram.Update.callback_query``, ``data`` is the full
+        # ``callback_data`` string. See PluginContext.register_telegram_callback_handler.
+        self._telegram_callback_handlers: List[tuple] = []
+        # Authorized text interceptors for plugin-owned ForceReply prompts.
+        # Each entry is (callback, plugin_name).
+        self._telegram_text_interceptors: List[tuple] = []
 
     # -----------------------------------------------------------------------
     # Public
@@ -1363,6 +1490,9 @@ class PluginManager:
             self._portable_mcp_servers.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._slack_view_handlers.clear()
+            self._telegram_callback_handlers.clear()
+            self._telegram_text_interceptors.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -2183,6 +2313,30 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_slack_view_handlers(self) -> List[tuple]:
+        """Return plugin-registered Slack modal view handlers."""
+        return list(self._slack_view_handlers)
+
+    # -----------------------------------------------------------------------
+    # Telegram callback handler accessor
+    # -----------------------------------------------------------------------
+
+    def get_telegram_callback_handlers(self) -> List[tuple]:
+        """Return the list of plugin-registered Telegram callback handlers.
+
+        Each entry is a ``(prefix, callback, plugin_name)`` tuple. Consumed
+        by the Telegram adapter's ``_handle_callback_query`` for any
+        ``callback_data`` that doesn't match a built-in prefix.
+
+        Plugins register handlers via
+        :meth:`PluginContext.register_telegram_callback_handler`.
+        """
+        return list(self._telegram_callback_handlers)
+
+    def get_telegram_text_interceptors(self) -> List[tuple]:
+        """Return plugin-registered authorized text interceptors."""
+        return list(self._telegram_text_interceptors)
 
     # -----------------------------------------------------------------------
     # Introspection

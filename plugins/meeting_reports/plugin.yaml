@@ -1,0 +1,9 @@
+name: meeting_reports
+version: 0.1.0
+description: "Portable meeting-processing kit: canonical JSON meeting reports, 24h-TTL HTML rendering, silent internal routing, and Accept/Reject completion cards for Telegram and Slack."
+author: Ariel Nurieli
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows

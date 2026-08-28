@@ -24,6 +24,60 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Public notification contract used by plugins that emit task-adjacent events.
+# Event kinds outside this allowlist are not claimed by the gateway notifier.
+TERMINAL_KINDS = (
+    "completed",
+    "blocked",
+    "gave_up",
+    "crashed",
+    "timed_out",
+    "status",
+    "archived",
+    "unblocked",
+    "block_loop_detected",
+)
+
+
+def _is_notify_silent(task: Optional[Any]) -> bool:
+    """Return whether ``task`` must be treated as ``notify_mode="silent"``.
+
+    Generic, source-agnostic gate for the whole terminal-event dispatch
+    path: completion/block/crash/timeout text pings, decision cards,
+    worker-summary text, and artifact uploads all flow through the single
+    call site that checks this (see ``_kanban_notifier_watcher``'s
+    ``_collect`` closure). A task's ``notify_mode`` is set once at
+    creation (``create_task`` / ``decompose_triage_task``) and never
+    mutated afterward.
+
+    Fails **closed**: a task with no readable ``notify_mode`` value keeps
+    the pre-existing default behaviour (``None`` -> not silent, so a
+    legacy row from before this column existed still notifies exactly as
+    it always has), but any value that isn't a recognized mode, such as a
+    corrupt column or an attribute that's unexpectedly missing from the
+    ``Task`` object, is NOT assumed safe to deliver. When we cannot
+    positively confirm a task is ``"default"``, we suppress rather than
+    risk leaking a terminal event, worker summary, or artifact for a task
+    that was meant to stay silent.
+
+    ``task=None`` (the row genuinely doesn't resolve, e.g. purged after
+    archival) is unrelated to silence and returns ``False`` unchanged;
+    existing callers already handle a ``None`` task by falling back to
+    the subscription's own task id.
+    """
+    if task is None:
+        return False
+    try:
+        mode = task.notify_mode
+    except AttributeError:
+        return True
+    if mode in (None, "default"):
+        return False
+    if mode == "silent":
+        return True
+    # Any other stored value is corrupt/unrecognized, so fail closed.
+    return True
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -197,7 +251,6 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -372,6 +425,21 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    if _is_notify_silent(task):
+                                        # Fail closed: the cursor above is
+                                        # already claimed/advanced, so this
+                                        # event range will never be replayed.
+                                        # No text ping, no decision card, no
+                                        # worker summary, and no artifact upload;
+                                        # none of the per-event delivery code
+                                        # below ever sees a silent task's
+                                        # events, on any adapter.
+                                        logger.debug(
+                                            "kanban notifier: task %s is notify_mode=silent; "
+                                            "suppressing %d claimed event(s) on board %s",
+                                            sub["task_id"], len(events), slug,
+                                        )
+                                        continue
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
